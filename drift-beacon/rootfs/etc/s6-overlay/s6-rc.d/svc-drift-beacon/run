@@ -1,0 +1,17 @@
+#!/usr/bin/with-contenv bashio
+# shellcheck shell=bash
+
+# Read port from environment (defaults to 3000 for internal use)
+PORT=${SERVICE_PORT:-3000}
+
+bashio::log.info "Starting Drift Beacon on port ${PORT}..."
+
+# Change to app directory
+cd /app/apps/server || exit 1
+
+# Set environment
+export NODE_ENV=production
+export PORT="$PORT"
+
+# Start server
+exec node dist/index.js

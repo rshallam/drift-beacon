@@ -1,0 +1,31 @@
+name: Drift Beacon
+version: "1.0.0"
+slug: drift-beacon
+description: Activity tracking
+url: https://github.com/rshallam/drift-beacon
+webui: "[PROTO:ssl]://[HOST]:[PORT:9000]"
+arch:
+  - aarch64
+ports:
+  9000/tcp: 9000
+  9001/tcp: 9001
+ports_description:
+  9000/tcp: Drift Beacon (HTTPS)
+  9001/tcp: Drift Beacon (HTTP)
+environment:
+  NODE_ENV: production
+  DEVICE_TYPE: home_assistant
+  PUSH_WORKER_URL: https://push-worker-staging.imrichsham.workers.dev
+startup: application
+boot: auto
+map:
+  - type: ssl
+schema:
+  ssl: bool
+  certfile: str?
+  keyfile: str?
+options:
+  ssl: true
+  certfile: fullchain.pem
+  keyfile: privkey.pem
+init: false

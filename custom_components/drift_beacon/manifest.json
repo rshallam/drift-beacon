@@ -1,0 +1,13 @@
+{
+  "domain": "drift_beacon",
+  "name": "Drift Beacon",
+  "codeowners": ["@rshallam"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/rshallam/drift-beacon",
+  "issue_tracker": "https://github.com/rshallam/drift-beacon/issues",
+  "integration_type": "service",
+  "iot_class": "local_polling",
+  "requirements": [],
+  "version": "1.0.0"
+}

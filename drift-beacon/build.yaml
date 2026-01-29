@@ -1,0 +1,6 @@
+build_from:
+  aarch64: ghcr.io/home-assistant/aarch64-base-debian:latest
+args:
+  BUILD_FROM: ghcr.io/home-assistant/aarch64-base-debian:latest
+  BUILD_ARCH: aarch64
+  TEMPIO_VERSION: 2024.11.2

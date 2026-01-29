@@ -1,0 +1,229 @@
+blueprint:
+  name: Drift Beacon Activity Lighting
+  description: >
+    Event-driven automation for controlling lights based on Drift Beacon sessions.
+    Uses events instead of state changes for more advanced use cases and faster response.
+
+    This blueprint listens to the following events:
+    - `drift_beacon_session_started` - New session begins
+    - `drift_beacon_session_changed` - Switch between activities
+    - `drift_beacon_session_stopped` - Session ends
+
+  domain: automation
+  source_url: https://github.com/yourusername/drift-beacon/blob/main/ha-integration/blueprints/drift_beacon_activity_lighting_events.yaml
+
+  input:
+    target_lights:
+      name: Target Lights
+      description: The lights or light groups to control based on active activity
+      selector:
+        target:
+          entity:
+            - domain: light
+
+    brightness:
+      name: Brightness
+      description: Brightness level for the lights (0-100%)
+      default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+          mode: slider
+
+    transition:
+      name: Transition Time
+      description: Time to transition between colors (in seconds)
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 10
+          unit_of_measurement: "s"
+          mode: slider
+          step: 0.5
+
+    turn_off_on_stop:
+      name: Turn Off Lights When Session Ends
+      description: Automatically turn off lights when you stop the session
+      default: true
+      selector:
+        boolean:
+
+    off_transition:
+      name: Turn Off Transition Time
+      description: Time to transition when turning off lights (in seconds)
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 10
+          unit_of_measurement: "s"
+          mode: slider
+          step: 0.5
+
+    activity_mode:
+      name: Mode
+      description: Choose how to filter which activities trigger this automation
+      default: exclude_mode
+      selector:
+        select:
+          options:
+            - label: ALL ACTIVITIES
+              value: exclude_mode
+            - label: SPECIFIC ACTIVITIES
+              value: include_mode
+
+    activity_exclude_entities:
+      name: "Activities to Exclude (MODE: ALL ACTIVITIES)"
+      description: Select activities that should NOT trigger lighting control (e.g., Break, Sleep)
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - integration: drift_beacon
+              domain: switch
+
+    activity_include_entities:
+      name: "Activities to Include (MODE: SPECIFIC ACTIVITIES)"
+      description: Select which activities should trigger lighting control
+      default: []
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - integration: drift_beacon
+              domain: switch
+
+    disable_when:
+      name: Disable When (Optional)
+      description: Pause activity lighting when these conditions are met. Leave empty to always run.
+      default: []
+      selector:
+        condition:
+
+mode: restart
+max_exceeded: silent
+
+variables:
+  turn_off_on_stop: !input turn_off_on_stop
+  brightness: !input brightness
+  transition: !input transition
+  off_transition: !input off_transition
+  activity_mode: !input activity_mode
+  activity_exclude_entities: !input activity_exclude_entities
+  activity_include_entities: !input activity_include_entities
+  disable_conditions: !input disable_when
+  activity_exclude_names: >
+    {% set names = [] %}
+    {% for entity_id in activity_exclude_entities %}
+      {% set name = state_attr(entity_id, 'name') %}
+      {% if name %}
+        {% set names = names + [name] %}
+      {% endif %}
+    {% endfor %}
+    {{ names }}
+  activity_include_names: >
+    {% set names = [] %}
+    {% for entity_id in activity_include_entities %}
+      {% set name = state_attr(entity_id, 'name') %}
+      {% if name %}
+        {% set names = names + [name] %}
+      {% endif %}
+    {% endfor %}
+    {{ names }}
+
+trigger:
+  - platform: event
+    event_type: drift_beacon_session_started
+    id: session_started
+
+  - platform: event
+    event_type: drift_beacon_session_changed
+    id: session_changed
+
+  - platform: event
+    event_type: drift_beacon_session_stopped
+    id: session_stopped
+
+condition:
+  # Activity selection mode check
+  - condition: template
+    value_template: >
+      {% if trigger.id not in ['session_started', 'session_changed'] %}
+        true
+      {% else %}
+        {% set activity_name = trigger.event.data.activity_name %}
+        {% if activity_mode == 'include_mode' %}
+          {{ activity_name in activity_include_names }}
+        {% else %}
+          {{ activity_name not in activity_exclude_names }}
+        {% endif %}
+      {% endif %}
+action:
+  - if: "{{ disable_conditions | length > 0 }}"
+    then:
+      # Disable conditions are set, check if they're true
+      - if: !input disable_when
+        then: []  # Conditions met, skip automation
+        else:
+          - choose:
+              # Session started or changed -> Update lights with activity color
+              - conditions:
+                  - condition: or
+                    conditions:
+                      - condition: trigger
+                        id: session_started
+                      - condition: trigger
+                        id: session_changed
+                sequence:
+                  - action: light.turn_on
+                    target: !input target_lights
+                    data:
+                      rgb_color: "{{ trigger.event.data.color }}"
+                      brightness_pct: !input brightness
+                      transition: !input transition
+
+              # Session stopped -> Turn off lights (if enabled)
+              - conditions:
+                  - condition: trigger
+                    id: session_stopped
+                  - condition: template
+                    value_template: "{{ turn_off_on_stop }}"
+                sequence:
+                  - action: light.turn_off
+                    target: !input target_lights
+                    data:
+                      transition: !input off_transition
+    else:
+      # No disable conditions set, always run
+      - choose:
+          # Session started or changed -> Update lights with activity color
+          - conditions:
+              - condition: or
+                conditions:
+                  - condition: trigger
+                    id: session_started
+                  - condition: trigger
+                    id: session_changed
+            sequence:
+              - action: light.turn_on
+                target: !input target_lights
+                data:
+                  rgb_color: "{{ trigger.event.data.color }}"
+                  brightness_pct: !input brightness
+                  transition: !input transition
+
+          # Session stopped -> Turn off lights (if enabled)
+          - conditions:
+              - condition: trigger
+                id: session_stopped
+              - condition: template
+                value_template: "{{ turn_off_on_stop }}"
+            sequence:
+              - action: light.turn_off
+                target: !input target_lights
+                data:
+                  transition: !input off_transition

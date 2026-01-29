@@ -1,0 +1,42 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Drift Beacon",
+        "description": "Sign in to your Drift Beacon account.\n\nDon't have an account? Sign up at: {webui_url}\n\n{detected_info}",
+        "data": {
+          "host": "Server Address",
+          "port": "Port",
+          "email": "Email",
+          "password": "Password"
+        },
+        "data_description": {
+          "host": "Hostname or IP address of your Drift Beacon server",
+          "port": "Port number (default: 9000)",
+          "email": "Your Drift Beacon account email",
+          "password": "Your Drift Beacon account password"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate",
+        "description": "Your session for {email} has expired. Please enter your password to reconnect.",
+        "data": {
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to connect to Drift Beacon server. Please check the host and port.",
+      "invalid_auth": "Invalid email or password. Please check your credentials.",
+      "invalid_server": "Server does not appear to be a Drift Beacon server. Please verify the address.",
+      "session_creation_failed": "Failed to create authentication session. Please try again.",
+      "wrong_account": "You must use the same account that was originally configured.",
+      "server_error": "The server returned an error. Please check the server logs.",
+      "unknown": "An unexpected error occurred. Please check the logs."
+    },
+    "abort": {
+      "already_configured": "This account is already configured for this server.",
+      "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
+    }
+  }
+}
