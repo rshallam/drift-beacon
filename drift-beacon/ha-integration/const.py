@@ -27,6 +27,7 @@ API_ACTIVITIES: Final = "/api/activities"
 API_LIVE_SESSION: Final = "/api/live-session"
 API_START_SESSION: Final = "/api/start-session"
 API_STOP_SESSION: Final = "/api/stop-session"
+API_MARK: Final = "/api/mark"
 
 # Timeouts
 API_TIMEOUT: Final = 5  # seconds
@@ -41,7 +42,7 @@ DETECTION_TIMEOUT: Final = 2  # seconds
 PROTOCOL_DETECTION_TIMEOUT: Final = 1.5  # seconds
 
 # Platforms
-PLATFORMS: Final = ["switch", "sensor"]
+PLATFORMS: Final = ["switch", "sensor", "button"]
 
 # Events
 EVENT_SESSION_STARTED: Final = "drift_beacon_session_started"

@@ -17,6 +17,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from .const import (
     API_ACTIVITIES,
     API_LIVE_SESSION,
+    API_MARK,
     API_START_SESSION,
     API_STOP_SESSION,
     API_TIMEOUT,
@@ -47,6 +48,7 @@ class Activity(TypedDict):
     sort_order: int
     color: list[int]
     icon: str
+    tracking_type: str
     workspace_id: str
     workspace_name: str
 
@@ -226,6 +228,36 @@ class DriftBeaconDataUpdateCoordinator(DataUpdateCoordinator[DriftBeaconData]):
         except Exception as err:
             _LOGGER.error(
                 "Failed to stop session for activity %s: %s", activity_id, err
+            )
+            return False
+
+    async def mark_activity(self, activity_id: str, workspace_id: str) -> bool:
+        """Mark a point activity."""
+        _LOGGER.debug("Marking activity %s in workspace %s", activity_id, workspace_id)
+
+        try:
+            await self._make_authenticated_request(
+                "POST",
+                API_MARK,
+                json={"activityId": activity_id, "workspaceId": workspace_id},
+            )
+
+            _LOGGER.info("Successfully marked activity %s", activity_id)
+            return True
+
+        except ConfigEntryAuthFailed:
+            _LOGGER.error("Authentication failed while marking activity")
+            raise
+        except aiohttp.ClientResponseError as err:
+            _LOGGER.error(
+                "Failed to mark activity %s: HTTP %s",
+                activity_id,
+                err.status,
+            )
+            return False
+        except Exception as err:
+            _LOGGER.error(
+                "Failed to mark activity %s: %s", activity_id, err
             )
             return False
 

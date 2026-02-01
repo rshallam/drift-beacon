@@ -50,8 +50,11 @@ async def async_setup_entry(
         """Add new entities and remove deleted ones."""
         activities = coordinator.data["activities"]
 
+        # Only create switches for span activities
+        span_activities = [a for a in activities if a.get("tracking_type") == "span"]
+
         # Get current activity IDs (server filters archived activities)
-        current_activity_ids = {activity["id"] for activity in activities}
+        current_activity_ids = {activity["id"] for activity in span_activities}
 
         existing_ids = set(entities.keys())
         new_ids = current_activity_ids - existing_ids
@@ -59,7 +62,7 @@ async def async_setup_entry(
 
         # Create entities for new activities
         new_entities = []
-        for activity in activities:
+        for activity in span_activities:
             if activity["id"] in new_ids:
                 entity = DriftBeaconActivitySwitch(
                     coordinator, activity, entry.entry_id
