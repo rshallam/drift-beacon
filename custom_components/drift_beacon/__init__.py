@@ -10,7 +10,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 
-from .const import CONF_HOST, CONF_PORT, DOMAIN
+from .const import CONF_API_TOKEN, CONF_HOST, CONF_HUB_ID, CONF_HUB_NAME, CONF_PORT, CONF_PROTOCOL, DOMAIN
 from .coordinator import DriftBeaconWebSocketManager
 
 if TYPE_CHECKING:
@@ -19,6 +19,33 @@ if TYPE_CHECKING:
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SWITCH, Platform.SENSOR, Platform.BUTTON]
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Migrate config entries from older versions."""
+    if entry.version == 1:
+        _LOGGER.debug("Migrating config entry from version 1 to 2")
+
+        # V1 used email/password auth with server session tokens.
+        # V2 uses pre-created API tokens. We can't derive an API token
+        # from the old session token, so keep what we can and trigger reauth.
+        new_data = {
+            CONF_HOST: entry.data.get(CONF_HOST, ""),
+            CONF_PORT: entry.data.get(CONF_PORT, 9000),
+            CONF_PROTOCOL: entry.data.get(CONF_PROTOCOL, "https"),
+            CONF_API_TOKEN: "",  # Empty — will trigger reauth
+            CONF_HUB_ID: entry.data.get(CONF_HUB_ID, ""),
+            CONF_HUB_NAME: entry.data.get(CONF_HUB_NAME, ""),
+        }
+
+        hass.config_entries.async_update_entry(entry, data=new_data, version=2)
+
+        # Trigger reauth so the user can provide a new API token
+        entry.async_start_reauth(hass)
+
+        _LOGGER.info("Migration to version 2 complete — reauthentication required")
+
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: DriftBeaconConfigEntry) -> bool:

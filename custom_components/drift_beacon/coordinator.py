@@ -16,10 +16,10 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
     API_TIMEOUT,
+    CONF_API_TOKEN,
     CONF_HOST,
     CONF_PORT,
     CONF_PROTOCOL,
-    CONF_SESSION_TOKEN,
     DOMAIN,
     EVENT_SESSION_CHANGED,
     EVENT_SESSION_STARTED,
@@ -89,6 +89,17 @@ type DriftBeaconConfigEntry = ConfigEntry["DriftBeaconWebSocketManager"]
 
 
 # ============================================================================
+# Color Conversion
+# ============================================================================
+
+
+def hex_to_rgb(hex_color: str) -> list[int]:
+    """Convert hex color string to RGB list. e.g. '#4A90D9' -> [74, 144, 217]."""
+    h = hex_color.lstrip("#")
+    return [int(h[i : i + 2], 16) for i in (0, 2, 4)]
+
+
+# ============================================================================
 # Parsing Helpers (camelCase → snake_case)
 # ============================================================================
 
@@ -153,12 +164,12 @@ class DriftBeaconWebSocketManager:
         """Initialize the WebSocket manager."""
         self.hass = hass
         self.config_entry = entry
-        self.session_token: str = entry.data[CONF_SESSION_TOKEN]
+        self.session_token: str = entry.data[CONF_API_TOKEN]
         self.host: str = entry.data[CONF_HOST]
         self.port: int = entry.data[CONF_PORT]
         self.protocol: str = entry.data.get(CONF_PROTOCOL, "https")
 
-        # State per workspace
+        # State per workspace (kept for future multi-workspace support)
         self._workspaces: list[Workspace] = []
         self._workspace_activities: dict[str, dict[str, Activity]] = {}
         self._workspace_categories: dict[str, dict[str, Category]] = {}
@@ -172,7 +183,7 @@ class DriftBeaconWebSocketManager:
         self._reconnect_attempt: int = 0
         self._intentional_disconnect: bool = False
         self._pending_responses: dict[int, asyncio.Future] = {}
-        self._subscription_rpc_ids: dict[int, str] = {}  # rpc_id -> workspace_id
+        self._subscription_rpc_id: int | None = None
 
         # HA integration
         self._listeners: list[Callable] = []
@@ -301,52 +312,25 @@ class DriftBeaconWebSocketManager:
 
         # List workspaces and subscribe
         try:
-            await self._setup_subscriptions()
+            await self._setup_subscription()
         except Exception as err:
             _LOGGER.error("Failed to set up subscriptions: %s", err)
             self._schedule_reconnect()
 
-    async def _setup_subscriptions(self) -> None:
-        """List workspaces and subscribe to all of them."""
-        result = await self._send_rpc("ListWorkspaces")
-        if not isinstance(result, list):
-            _LOGGER.error("Unexpected ListWorkspaces response: %s", result)
-            return
+    async def _setup_subscription(self) -> None:
+        """Subscribe to the workspace scoped by the API key."""
+        rpc_id = self._next_rpc_id()
+        self._subscription_rpc_id = rpc_id
 
-        self._workspaces = [_parse_workspace(w) for w in result]
+        request = {
+            "jsonrpc": "2.0",
+            "method": "Subscribe",
+            "params": {},
+            "id": rpc_id,
+        }
 
-        if not self._workspaces:
-            _LOGGER.warning("No workspaces available")
-            self._available = True
-            self._notify_listeners()
-            return
-
-        _LOGGER.debug(
-            "Found %d workspace(s): %s",
-            len(self._workspaces),
-            [w["name"] for w in self._workspaces],
-        )
-
-        # Subscribe to each workspace
-        for workspace in self._workspaces:
-            ws_id = workspace["id"]
-            rpc_id = self._next_rpc_id()
-            self._subscription_rpc_ids[rpc_id] = ws_id
-
-            # Initialize per-workspace state
-            self._workspace_activities.setdefault(ws_id, {})
-            self._workspace_categories.setdefault(ws_id, {})
-            self._workspace_live_sessions.setdefault(ws_id, None)
-
-            request = {
-                "jsonrpc": "2.0",
-                "method": "Subscribe",
-                "params": {"workspaceId": ws_id},
-                "id": rpc_id,
-            }
-
-            _LOGGER.debug("Subscribing to workspace %s (rpc_id=%d)", ws_id, rpc_id)
-            await self._ws.send_json(request)
+        _LOGGER.debug("Subscribing (rpc_id=%d)", rpc_id)
+        await self._ws.send_json(request)
 
     async def async_disconnect(self) -> None:
         """Gracefully disconnect from the WebSocket."""
@@ -358,22 +342,21 @@ class DriftBeaconWebSocketManager:
 
         if self._ws and not self._ws.closed:
             # Best-effort unsubscribe
-            for ws_id in [w["id"] for w in self._workspaces]:
-                try:
-                    rpc_id = self._next_rpc_id()
-                    await asyncio.wait_for(
-                        self._ws.send_json(
-                            {
-                                "jsonrpc": "2.0",
-                                "method": "Unsubscribe",
-                                "params": {"workspaceId": ws_id},
-                                "id": rpc_id,
-                            }
-                        ),
-                        timeout=2,
-                    )
-                except (asyncio.TimeoutError, Exception):
-                    pass
+            try:
+                rpc_id = self._next_rpc_id()
+                await asyncio.wait_for(
+                    self._ws.send_json(
+                        {
+                            "jsonrpc": "2.0",
+                            "method": "Unsubscribe",
+                            "params": {},
+                            "id": rpc_id,
+                        }
+                    ),
+                    timeout=2,
+                )
+            except (asyncio.TimeoutError, Exception):
+                pass
 
             await self._ws.close()
 
@@ -388,7 +371,7 @@ class DriftBeaconWebSocketManager:
             if not future.done():
                 future.cancel()
         self._pending_responses.clear()
-        self._subscription_rpc_ids.clear()
+        self._subscription_rpc_id = None
 
         self._available = False
         self._notify_listeners()
@@ -489,8 +472,7 @@ class DriftBeaconWebSocketManager:
 
         if is_chunked:
             # Stream messages from Subscribe
-            workspace_id = self._subscription_rpc_ids.get(rpc_id)
-            if workspace_id is None:
+            if rpc_id != self._subscription_rpc_id:
                 _LOGGER.debug(
                     "Received chunked message for unknown rpc_id=%s", rpc_id
                 )
@@ -498,10 +480,10 @@ class DriftBeaconWebSocketManager:
 
             results = data.get("result", [])
             for msg in results:
-                self._apply_stream_message(msg, workspace_id)
+                self._apply_stream_message(msg)
             self._notify_listeners()
         else:
-            # Non-stream RPC response (ListWorkspaces, StartSession, etc.)
+            # Non-stream RPC response (StartSession, StopSession, etc.)
             if rpc_id and rpc_id in self._pending_responses:
                 self._pending_responses.pop(rpc_id).set_result(
                     data.get("result")
@@ -511,9 +493,7 @@ class DriftBeaconWebSocketManager:
     # Stream Message Handlers
     # ========================================================================
 
-    def _apply_stream_message(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
+    def _apply_stream_message(self, msg: dict[str, Any]) -> None:
         """Apply a single stream message to local state."""
         tag = msg.get("_tag")
         if not tag:
@@ -532,14 +512,18 @@ class DriftBeaconWebSocketManager:
         }.get(tag)
 
         if handler:
-            handler(msg, workspace_id)
+            handler(msg)
         else:
             _LOGGER.debug("Unknown stream message tag: %s", tag)
 
-    def _apply_snapshot(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
-        """Apply a Snapshot message — full state replacement for a workspace."""
+    def _apply_snapshot(self, msg: dict[str, Any]) -> None:
+        """Apply a Snapshot message — full state replacement for the workspace."""
+        workspace_id = msg.get("workspaceId", "")
+        workspace_name = msg.get("workspaceName", workspace_id)
+
+        # Populate workspace list from Snapshot
+        self._workspaces = [Workspace(id=workspace_id, name=workspace_name)]
+
         activities_raw = msg.get("activities", [])
         categories_raw = msg.get("categories", [])
         live_session_raw = msg.get("liveSession")
@@ -558,71 +542,65 @@ class DriftBeaconWebSocketManager:
         self._reconnect_attempt = 0
 
         _LOGGER.debug(
-            "Snapshot received for workspace %s: %d activities, %d categories, live_session=%s",
+            "Snapshot received for workspace %s (%s): %d activities, %d categories, live_session=%s",
+            workspace_name,
             workspace_id,
             len(activities_raw),
             len(categories_raw),
             "yes" if live_session_raw else "no",
         )
 
-    def _apply_activity_created(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
+    def _apply_activity_created(self, msg: dict[str, Any]) -> None:
         activity = _parse_activity(msg["activity"])
-        self._workspace_activities.setdefault(workspace_id, {})[
+        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
+        self._workspace_activities.setdefault(ws_id, {})[
             activity["id"]
         ] = activity
         _LOGGER.debug("Activity created: %s (%s)", activity["name"], activity["id"])
 
-    def _apply_activity_updated(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
+    def _apply_activity_updated(self, msg: dict[str, Any]) -> None:
         activity = _parse_activity(msg["activity"])
-        self._workspace_activities.setdefault(workspace_id, {})[
+        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
+        self._workspace_activities.setdefault(ws_id, {})[
             activity["id"]
         ] = activity
         _LOGGER.debug("Activity updated: %s (%s)", activity["name"], activity["id"])
 
-    def _apply_activity_deleted(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
+    def _apply_activity_deleted(self, msg: dict[str, Any]) -> None:
         activity_id = msg["activityId"]
-        acts = self._workspace_activities.get(workspace_id, {})
+        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
+        acts = self._workspace_activities.get(ws_id, {})
         acts.pop(activity_id, None)
         _LOGGER.debug("Activity deleted: %s", activity_id)
 
-    def _apply_category_created(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
+    def _apply_category_created(self, msg: dict[str, Any]) -> None:
         category = _parse_category(msg["category"])
-        self._workspace_categories.setdefault(workspace_id, {})[
+        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
+        self._workspace_categories.setdefault(ws_id, {})[
             category["id"]
         ] = category
 
-    def _apply_category_updated(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
+    def _apply_category_updated(self, msg: dict[str, Any]) -> None:
         category = _parse_category(msg["category"])
-        self._workspace_categories.setdefault(workspace_id, {})[
+        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
+        self._workspace_categories.setdefault(ws_id, {})[
             category["id"]
         ] = category
 
-    def _apply_category_deleted(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
+    def _apply_category_deleted(self, msg: dict[str, Any]) -> None:
         cat_id = msg["categoryId"]
-        cats = self._workspace_categories.get(workspace_id, {})
+        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
+        cats = self._workspace_categories.get(ws_id, {})
         cats.pop(cat_id, None)
 
-    def _apply_session_started(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
-        prev_session = self._workspace_live_sessions.get(workspace_id)
+    def _apply_session_started(self, msg: dict[str, Any]) -> None:
+        workspace = self._workspaces[0] if self._workspaces else None
+        ws_id = workspace["id"] if workspace else ""
+        prev_session = self._workspace_live_sessions.get(ws_id)
         new_session = _parse_live_session(msg["session"])
-        self._workspace_live_sessions[workspace_id] = new_session
+        self._workspace_live_sessions[ws_id] = new_session
 
         activity = self.get_activity(new_session["activity_id"])
-        workspace = self._get_workspace_by_id(workspace_id)
 
         if activity and workspace:
             category = self.get_category(activity.get("category_id"))
@@ -630,12 +608,12 @@ class DriftBeaconWebSocketManager:
             event_data: dict[str, Any] = {
                 "activity_id": activity["id"],
                 "activity_name": activity["name"],
-                "color": activity["color"],
+                "color": hex_to_rgb(activity["color"]),
                 "icon": activity["icon"],
                 "category_id": activity.get("category_id"),
                 "category_name": category["name"] if category else None,
                 "category_icon": category["icon"] if category else None,
-                "category_color": category["color"] if category else None,
+                "category_color": hex_to_rgb(category["color"]) if category else None,
                 "workspace_id": workspace["id"],
                 "workspace_name": workspace["name"],
                 "session_start_time": new_session["start_time"],
@@ -658,15 +636,14 @@ class DriftBeaconWebSocketManager:
                 self.hass.bus.async_fire(EVENT_SESSION_STARTED, event_data)
                 _LOGGER.debug("Session started: %s", activity["name"])
 
-    def _apply_session_ended(
-        self, msg: dict[str, Any], workspace_id: str
-    ) -> None:
+    def _apply_session_ended(self, msg: dict[str, Any]) -> None:
         session_id = msg["sessionId"]
         activity_id = msg["activityId"]
-        self._workspace_live_sessions[workspace_id] = None
+        workspace = self._workspaces[0] if self._workspaces else None
+        ws_id = workspace["id"] if workspace else ""
+        self._workspace_live_sessions[ws_id] = None
 
         activity = self.get_activity(activity_id)
-        workspace = self._get_workspace_by_id(workspace_id)
 
         if activity and workspace:
             self.hass.bus.async_fire(
@@ -684,49 +661,39 @@ class DriftBeaconWebSocketManager:
     # Actions
     # ========================================================================
 
-    async def start_session(self, activity_id: str, workspace_id: str) -> bool:
+    async def start_session(self, activity_id: str) -> bool:
         """Start a span session for an activity via RPC."""
-        _LOGGER.debug(
-            "Starting session for activity %s in workspace %s",
-            activity_id,
-            workspace_id,
-        )
+        _LOGGER.debug("Starting session for activity %s", activity_id)
         try:
             await self._send_rpc(
                 "StartSession",
-                {"workspaceId": workspace_id, "activityId": activity_id},
+                {"activityId": activity_id},
             )
             return True
         except Exception as err:
             _LOGGER.error("Failed to start session: %s", err)
             return False
 
-    async def stop_session(self, activity_id: str, workspace_id: str) -> bool:
+    async def stop_session(self, activity_id: str) -> bool:
         """Stop the live session for an activity via RPC."""
-        _LOGGER.debug(
-            "Stopping session for activity %s in workspace %s",
-            activity_id,
-            workspace_id,
-        )
+        _LOGGER.debug("Stopping session for activity %s", activity_id)
         try:
             await self._send_rpc(
                 "StopSession",
-                {"workspaceId": workspace_id, "activityId": activity_id},
+                {"activityId": activity_id},
             )
             return True
         except Exception as err:
             _LOGGER.error("Failed to stop session: %s", err)
             return False
 
-    async def mark_activity(self, activity_id: str, workspace_id: str) -> bool:
+    async def mark_activity(self, activity_id: str) -> bool:
         """Mark a point activity via RPC."""
-        _LOGGER.debug(
-            "Marking activity %s in workspace %s", activity_id, workspace_id
-        )
+        _LOGGER.debug("Marking activity %s", activity_id)
         try:
             await self._send_rpc(
                 "Mark",
-                {"workspaceId": workspace_id, "activityId": activity_id},
+                {"activityId": activity_id},
             )
             return True
         except Exception as err:
@@ -779,6 +746,6 @@ class DriftBeaconWebSocketManager:
             if not future.done():
                 future.cancel()
         self._pending_responses.clear()
-        self._subscription_rpc_ids.clear()
+        self._subscription_rpc_id = None
 
         await self.async_connect()

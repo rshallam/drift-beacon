@@ -22,6 +22,9 @@ from .const import (
     ATTR_SESSION_DURATION,
     ATTR_SESSION_DURATION_FORMATTED,
     ATTR_SESSION_START_TIME,
+    ATTR_TARGET,
+    ATTR_UNIT,
+    ATTR_PROGRESS,
     ATTR_WORKSPACE_ID,
     ATTR_WORKSPACE_NAME,
     DOMAIN,
@@ -30,6 +33,7 @@ from .coordinator import (
     Activity,
     DriftBeaconConfigEntry,
     DriftBeaconWebSocketManager,
+    hex_to_rgb,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -158,12 +162,15 @@ class DriftBeaconLiveSessionSensor(SensorEntity):
         attributes = {
             ATTR_ACTIVITY_ID: activity["id"],
             ATTR_ACTIVITY_NAME: activity["name"],
-            ATTR_COLOR: activity["color"],
+            ATTR_COLOR: hex_to_rgb(activity["color"]),
             ATTR_ICON: activity["icon"],
             ATTR_CATEGORY_ID: activity.get("category_id"),
             ATTR_CATEGORY_NAME: category["name"] if category else None,
             ATTR_CATEGORY_ICON: category["icon"] if category else None,
-            ATTR_CATEGORY_COLOR: category["color"] if category else None,
+            ATTR_CATEGORY_COLOR: hex_to_rgb(category["color"]) if category else None,
+            ATTR_UNIT: activity.get("unit"),
+            ATTR_PROGRESS: activity["progress"]["current"],
+            ATTR_TARGET: activity["progress"]["target"],
             ATTR_WORKSPACE_ID: self._workspace_id,
             ATTR_WORKSPACE_NAME: self._workspace_name,
             ATTR_SESSION_START_TIME: session["start_time"],

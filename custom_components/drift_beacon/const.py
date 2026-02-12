@@ -6,11 +6,7 @@ DOMAIN: Final = "drift_beacon"
 CONF_HOST: Final = "host"
 CONF_PORT: Final = "port"
 CONF_PROTOCOL: Final = "protocol"
-CONF_EMAIL: Final = "email"
-CONF_PASSWORD: Final = "password"
-CONF_USER_ID: Final = "user_id"
-CONF_SESSION_TOKEN: Final = "session_token"
-CONF_SESSION_EXPIRES: Final = "session_expires"
+CONF_API_TOKEN: Final = "api_token"
 CONF_HUB_ID: Final = "hub_id"
 CONF_HUB_NAME: Final = "hub_name"
 
@@ -20,8 +16,6 @@ DEFAULT_PORT: Final = 9000
 
 # API endpoints (HTTP — used by config_flow only)
 API_SYSTEM_STATUS: Final = "/api/device/status"
-API_AUTH_SIGN_IN: Final = "/api/auth/sign-in/email"
-API_AUTH_CREATE_SERVER_SESSION: Final = "/api/auth/create-server-session"
 
 # WebSocket
 WS_PATH: Final = "/api/ws"
@@ -59,6 +53,9 @@ ATTR_CATEGORY_COLOR: Final = "category_color"
 ATTR_COLOR: Final = "color"
 ATTR_ICON: Final = "icon"
 ATTR_SORT_ORDER: Final = "sort_order"
+ATTR_UNIT: Final = "unit"
+ATTR_PROGRESS: Final = "progress"
+ATTR_TARGET: Final = "target"
 ATTR_WORKSPACE_ID: Final = "workspace_id"
 ATTR_WORKSPACE_NAME: Final = "workspace_name"
 ATTR_SESSION_START_TIME: Final = "session_start_time"

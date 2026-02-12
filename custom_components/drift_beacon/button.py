@@ -19,6 +19,9 @@ from .const import (
     ATTR_DESCRIPTION,
     ATTR_ICON,
     ATTR_SORT_ORDER,
+    ATTR_TARGET,
+    ATTR_UNIT,
+    ATTR_PROGRESS,
     ATTR_WORKSPACE_ID,
     ATTR_WORKSPACE_NAME,
     DOMAIN,
@@ -27,6 +30,7 @@ from .coordinator import (
     Activity,
     DriftBeaconConfigEntry,
     DriftBeaconWebSocketManager,
+    hex_to_rgb,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -132,10 +136,13 @@ class DriftBeaconActivityButton(ButtonEntity):
             ATTR_CATEGORY_ID: activity.get("category_id"),
             ATTR_CATEGORY_NAME: category["name"] if category else None,
             ATTR_CATEGORY_ICON: category["icon"] if category else None,
-            ATTR_CATEGORY_COLOR: category["color"] if category else None,
-            ATTR_COLOR: activity["color"],
+            ATTR_CATEGORY_COLOR: hex_to_rgb(category["color"]) if category else None,
+            ATTR_COLOR: hex_to_rgb(activity["color"]),
             ATTR_ICON: activity["icon"],
             ATTR_SORT_ORDER: activity["sort_order"],
+            ATTR_UNIT: activity.get("unit"),
+            ATTR_PROGRESS: activity["progress"]["current"],
+            ATTR_TARGET: activity["progress"]["target"],
             ATTR_WORKSPACE_ID: workspace["id"] if workspace else None,
             ATTR_WORKSPACE_NAME: workspace["name"] if workspace else None,
         }
@@ -149,7 +156,7 @@ class DriftBeaconActivityButton(ButtonEntity):
             _LOGGER.error("Cannot mark activity %s - workspace not found", self._activity_id)
             return
 
-        success = await self._manager.mark_activity(self._activity_id, workspace["id"])
+        success = await self._manager.mark_activity(self._activity_id)
 
         if not success:
             _LOGGER.error("Failed to mark activity %s", self._activity_id)

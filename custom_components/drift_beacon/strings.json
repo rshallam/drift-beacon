@@ -3,39 +3,35 @@
     "step": {
       "user": {
         "title": "Connect to Drift Beacon",
-        "description": "Sign in to your Drift Beacon account.\n\nDon't have an account? Sign up at: {webui_url}\n\n{detected_info}",
+        "description": "Enter your Drift Beacon server details and access token.\n\nCreate a token in the Drift Beacon web app under Settings → Access Tokens.\n\n{detected_info}",
         "data": {
           "host": "Server Address",
           "port": "Port",
-          "email": "Email",
-          "password": "Password"
+          "api_token": "Access Token"
         },
         "data_description": {
           "host": "Hostname or IP address of your Drift Beacon server",
           "port": "Port number (default: 9000)",
-          "email": "Your Drift Beacon account email",
-          "password": "Your Drift Beacon account password"
+          "api_token": "Long-lived access token created from the Drift Beacon web app"
         }
       },
       "reauth_confirm": {
         "title": "Reauthenticate",
-        "description": "Your session for {email} has expired. Please enter your password to reconnect.",
+        "description": "Your access token is invalid or expired. Please enter a new token.",
         "data": {
-          "password": "Password"
+          "api_token": "Access Token"
         }
       }
     },
     "error": {
       "cannot_connect": "Unable to connect to Drift Beacon server. Please check the host and port.",
-      "invalid_auth": "Invalid email or password. Please check your credentials.",
+      "invalid_auth": "Invalid access token. Please check your token and try again.",
       "invalid_server": "Server does not appear to be a Drift Beacon server. Please verify the address.",
-      "session_creation_failed": "Failed to create authentication session. Please try again.",
-      "wrong_account": "You must use the same account that was originally configured.",
       "server_error": "The server returned an error. Please check the server logs.",
       "unknown": "An unexpected error occurred. Please check the logs."
     },
     "abort": {
-      "already_configured": "This account is already configured for this server.",
+      "already_configured": "This server is already configured.",
       "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
     }
   }
