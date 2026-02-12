@@ -17,16 +17,16 @@ CONF_HUB_NAME: Final = "hub_name"
 # Default values
 DEFAULT_HOST: Final = "local-drift-beacon"
 DEFAULT_PORT: Final = 9000
-DEFAULT_SCAN_INTERVAL: Final = 3  # seconds
 
-# API endpoints
+# API endpoints (HTTP — used by config_flow only)
 API_SYSTEM_STATUS: Final = "/api/device/status"
 API_AUTH_SIGN_IN: Final = "/api/auth/sign-in/email"
 API_AUTH_CREATE_SERVER_SESSION: Final = "/api/auth/create-server-session"
-API_ACTIVITIES: Final = "/api/activities"
-API_LIVE_SESSION: Final = "/api/live-session"
-API_START_SESSION: Final = "/api/start-session"
-API_STOP_SESSION: Final = "/api/stop-session"
+
+# WebSocket
+WS_PATH: Final = "/api/ws"
+WS_RECONNECT_MIN_DELAY: Final = 1  # seconds
+WS_RECONNECT_MAX_DELAY: Final = 30  # seconds
 
 # Timeouts
 API_TIMEOUT: Final = 5  # seconds
@@ -41,7 +41,7 @@ DETECTION_TIMEOUT: Final = 2  # seconds
 PROTOCOL_DETECTION_TIMEOUT: Final = 1.5  # seconds
 
 # Platforms
-PLATFORMS: Final = ["switch", "sensor"]
+PLATFORMS: Final = ["switch", "sensor", "button"]
 
 # Events
 EVENT_SESSION_STARTED: Final = "drift_beacon_session_started"

@@ -1,336 +1,784 @@
-"""Data update coordinator for Drift Beacon."""
+"""WebSocket manager for Drift Beacon integration."""
 
 from __future__ import annotations
 
-from datetime import timedelta
+import asyncio
+import json
 import logging
-from typing import Any, TypedDict
+from typing import Any, Callable, TypedDict
 
 import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
-    API_ACTIVITIES,
-    API_LIVE_SESSION,
-    API_START_SESSION,
-    API_STOP_SESSION,
     API_TIMEOUT,
     CONF_HOST,
     CONF_PORT,
     CONF_PROTOCOL,
     CONF_SESSION_TOKEN,
-    DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     EVENT_SESSION_CHANGED,
     EVENT_SESSION_STARTED,
     EVENT_SESSION_STOPPED,
+    WS_PATH,
+    WS_RECONNECT_MAX_DELAY,
+    WS_RECONNECT_MIN_DELAY,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 
+# ============================================================================
+# Data Models
+# ============================================================================
+
+
+class ActivityProgress(TypedDict):
+    """Activity progress data."""
+
+    current: float
+    target: float | None
+
+
 class Activity(TypedDict):
-    """Activity data structure."""
+    """Activity data from WebSocket API."""
 
     id: str
     name: str
     description: str | None
     category_id: str | None
-    category_name: str | None
-    category_icon: str | None
-    category_color: list[int] | None
     sort_order: int
-    color: list[int]
+    color: str  # hex color e.g. "#4A90D9"
     icon: str
-    workspace_id: str
-    workspace_name: str
+    tracking_type: str  # "span" | "point"
+    archived: bool
+    unit: str | None
+    progress: ActivityProgress
 
 
-class Session(TypedDict):
-    """Session data structure."""
+class Category(TypedDict):
+    """Category data from WebSocket API."""
+
+    id: str
+    name: str
+    color: str  # hex color
+    icon: str
+    sort_order: int
+
+
+class Workspace(TypedDict):
+    """Workspace data from WebSocket API."""
+
+    id: str
+    name: str
+
+
+class LiveSession(TypedDict):
+    """Live session data from WebSocket API."""
 
     id: str
     activity_id: str
-    start_time: str
-    end_time: str | None
-    workspace_id: str
-    workspace_name: str
+    start_time: str  # ISO 8601
 
 
-class DriftBeaconData(TypedDict):
-    """Drift Beacon coordinator data structure."""
-
-    activities: list[Activity]
-    live_sessions: list[Session]
+type DriftBeaconConfigEntry = ConfigEntry["DriftBeaconWebSocketManager"]
 
 
-type DriftBeaconConfigEntry = ConfigEntry[DriftBeaconDataUpdateCoordinator]
+# ============================================================================
+# Parsing Helpers (camelCase → snake_case)
+# ============================================================================
 
 
-class DriftBeaconDataUpdateCoordinator(DataUpdateCoordinator[DriftBeaconData]):
-    """Class to manage fetching Drift Beacon data with authentication."""
+def _parse_activity(data: dict[str, Any]) -> Activity:
+    """Parse a raw activity dict from the WebSocket API."""
+    progress_raw = data.get("progress", {})
+    return Activity(
+        id=data["id"],
+        name=data["name"],
+        description=data.get("description"),
+        category_id=data.get("categoryId"),
+        sort_order=data.get("sortOrder", 0),
+        color=data.get("color", "#808080"),
+        icon=data.get("icon", "mdi:circle"),
+        tracking_type=data.get("trackingType", "span"),
+        archived=data.get("archived", False),
+        unit=data.get("unit"),
+        progress=ActivityProgress(
+            current=progress_raw.get("current", 0),
+            target=progress_raw.get("target"),
+        ),
+    )
+
+
+def _parse_category(data: dict[str, Any]) -> Category:
+    """Parse a raw category dict from the WebSocket API."""
+    return Category(
+        id=data["id"],
+        name=data["name"],
+        color=data.get("color", "#808080"),
+        icon=data.get("icon", "mdi:circle"),
+        sort_order=data.get("sortOrder", 0),
+    )
+
+
+def _parse_workspace(data: dict[str, Any]) -> Workspace:
+    """Parse a raw workspace dict from the WebSocket API."""
+    return Workspace(id=data["id"], name=data["name"])
+
+
+def _parse_live_session(data: dict[str, Any]) -> LiveSession:
+    """Parse a raw live session dict from the WebSocket API."""
+    return LiveSession(
+        id=data["id"],
+        activity_id=data.get("activityId", ""),
+        start_time=data.get("startTime", ""),
+    )
+
+
+# ============================================================================
+# WebSocket Manager
+# ============================================================================
+
+
+class DriftBeaconWebSocketManager:
+    """Manages WebSocket connection and state for the Drift Beacon integration."""
 
     config_entry: DriftBeaconConfigEntry
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        """Initialize the coordinator."""
-        self.session_token = entry.data[CONF_SESSION_TOKEN]
-        self.host = entry.data[CONF_HOST]
-        self.port = entry.data[CONF_PORT]
-        self.protocol = entry.data.get(CONF_PROTOCOL, "https")  # Default to https for backward compat
-        self.base_url = f"{self.protocol}://{self.host}:{self.port}"
-        self.session = async_get_clientsession(hass)
+        """Initialize the WebSocket manager."""
+        self.hass = hass
+        self.config_entry = entry
+        self.session_token: str = entry.data[CONF_SESSION_TOKEN]
+        self.host: str = entry.data[CONF_HOST]
+        self.port: int = entry.data[CONF_PORT]
+        self.protocol: str = entry.data.get(CONF_PROTOCOL, "https")
 
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_interval=timedelta(seconds=DEFAULT_SCAN_INTERVAL),
+        # State per workspace
+        self._workspaces: list[Workspace] = []
+        self._workspace_activities: dict[str, dict[str, Activity]] = {}
+        self._workspace_categories: dict[str, dict[str, Category]] = {}
+        self._workspace_live_sessions: dict[str, LiveSession | None] = {}
+
+        # Connection
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._rpc_id: int = 0
+        self._listen_task: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_attempt: int = 0
+        self._intentional_disconnect: bool = False
+        self._pending_responses: dict[int, asyncio.Future] = {}
+        self._subscription_rpc_ids: dict[int, str] = {}  # rpc_id -> workspace_id
+
+        # HA integration
+        self._listeners: list[Callable] = []
+        self._available: bool = False
+
+    # ========================================================================
+    # Public State Properties
+    # ========================================================================
+
+    @property
+    def available(self) -> bool:
+        """Return True when connected and data has been received."""
+        return self._available
+
+    @property
+    def workspaces(self) -> list[Workspace]:
+        """Return all workspaces."""
+        return list(self._workspaces)
+
+    @property
+    def activities(self) -> list[Activity]:
+        """Return a flat list of all activities across workspaces."""
+        result: list[Activity] = []
+        for acts in self._workspace_activities.values():
+            result.extend(acts.values())
+        return result
+
+    def get_activity(self, activity_id: str) -> Activity | None:
+        """Look up an activity by ID across all workspaces."""
+        for acts in self._workspace_activities.values():
+            if activity_id in acts:
+                return acts[activity_id]
+        return None
+
+    def get_category(self, category_id: str | None) -> Category | None:
+        """Look up a category by ID across all workspaces."""
+        if category_id is None:
+            return None
+        for cats in self._workspace_categories.values():
+            if category_id in cats:
+                return cats[category_id]
+        return None
+
+    def get_workspace_for_activity(self, activity_id: str) -> Workspace | None:
+        """Get the workspace that contains a given activity."""
+        for ws_id, acts in self._workspace_activities.items():
+            if activity_id in acts:
+                return self._get_workspace_by_id(ws_id)
+        return None
+
+    def get_live_session(self, workspace_id: str) -> LiveSession | None:
+        """Get the live session for a workspace."""
+        return self._workspace_live_sessions.get(workspace_id)
+
+    def _get_workspace_by_id(self, workspace_id: str) -> Workspace | None:
+        """Get a workspace by its ID."""
+        for ws in self._workspaces:
+            if ws["id"] == workspace_id:
+                return ws
+        return None
+
+    # ========================================================================
+    # Listener Management
+    # ========================================================================
+
+    @callback
+    def async_add_listener(self, update_callback: Callable) -> Callable:
+        """Add a listener and return a removal callable."""
+        self._listeners.append(update_callback)
+
+        @callback
+        def remove_listener() -> None:
+            if update_callback in self._listeners:
+                self._listeners.remove(update_callback)
+
+        return remove_listener
+
+    @callback
+    def _notify_listeners(self) -> None:
+        """Notify all registered listeners of a state change."""
+        for listener in self._listeners:
+            listener()
+
+    # ========================================================================
+    # Connection Lifecycle
+    # ========================================================================
+
+    async def async_connect(self) -> None:
+        """Connect to the WebSocket, list workspaces, and subscribe."""
+        self._intentional_disconnect = False
+
+        ws_scheme = "wss" if self.protocol == "https" else "ws"
+        ws_url = f"{ws_scheme}://{self.host}:{self.port}{WS_PATH}"
+
+        _LOGGER.debug("Connecting to WebSocket at %s", ws_url)
+
+        http_session = async_get_clientsession(self.hass)
+
+        try:
+            self._ws = await http_session.ws_connect(
+                ws_url,
+                headers={"Authorization": f"Bearer {self.session_token}"},
+                ssl=False,
+                heartbeat=30,
+                timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
+            )
+        except aiohttp.WSServerHandshakeError as err:
+            if err.status == 401:
+                raise ConfigEntryAuthFailed(
+                    "Session token expired or invalid"
+                ) from err
+            _LOGGER.error("WebSocket handshake failed: %s", err)
+            self._schedule_reconnect()
+            return
+        except (aiohttp.ClientError, OSError) as err:
+            _LOGGER.error("Failed to connect WebSocket: %s", err)
+            self._schedule_reconnect()
+            return
+
+        _LOGGER.info("WebSocket connected to %s", ws_url)
+
+        # Start the listen loop
+        self._listen_task = self.hass.async_create_task(
+            self._listen_loop(), f"{DOMAIN}_ws_listen"
         )
 
-    async def _make_authenticated_request(
-        self, method: str, endpoint: str, **kwargs: Any
-    ) -> Any:
-        """Make authenticated API request with Bearer token."""
-        headers = kwargs.pop("headers", {})
-        headers["Authorization"] = f"Bearer {self.session_token}"
-
-        url = f"{self.base_url}{endpoint}"
-
+        # List workspaces and subscribe
         try:
-            async with self.session.request(
-                method,
-                url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
-                ssl=False,  # Disable SSL verification for local add-on with self-signed certs
-                **kwargs,
-            ) as response:
-                if response.status == 401:
-                    raise ConfigEntryAuthFailed(
-                        "Authentication failed. Session token expired or invalid."
-                    )
-                response.raise_for_status()
-                return await response.json()
-        except ConfigEntryAuthFailed:
-            # Re-raise auth failures to trigger reauth flow
-            raise
-        except aiohttp.ClientResponseError as err:
-            _LOGGER.error(
-                "API request failed: %s %s - HTTP %s", method, endpoint, err.status
-            )
-            raise
+            await self._setup_subscriptions()
         except Exception as err:
-            _LOGGER.error("Request error for %s %s: %s", method, endpoint, err)
-            raise
+            _LOGGER.error("Failed to set up subscriptions: %s", err)
+            self._schedule_reconnect()
 
-    async def _async_update_data(self) -> DriftBeaconData:
-        """Fetch data from Drift Beacon API with authentication."""
-        try:
-            # Store old sessions before fetching new data (for event firing)
-            old_sessions = self.data.get("live_sessions", []) if self.data else []
+    async def _setup_subscriptions(self) -> None:
+        """List workspaces and subscribe to all of them."""
+        result = await self._send_rpc("ListWorkspaces")
+        if not isinstance(result, list):
+            _LOGGER.error("Unexpected ListWorkspaces response: %s", result)
+            return
 
-            # Fetch activities and live sessions (now returns array)
-            activities = await self._make_authenticated_request("GET", API_ACTIVITIES)
-            live_sessions = await self._make_authenticated_request(
-                "GET", API_LIVE_SESSION
-            )
+        self._workspaces = [_parse_workspace(w) for w in result]
 
-            new_data = {
-                "activities": activities,
-                "live_sessions": live_sessions,
+        if not self._workspaces:
+            _LOGGER.warning("No workspaces available")
+            self._available = True
+            self._notify_listeners()
+            return
+
+        _LOGGER.debug(
+            "Found %d workspace(s): %s",
+            len(self._workspaces),
+            [w["name"] for w in self._workspaces],
+        )
+
+        # Subscribe to each workspace
+        for workspace in self._workspaces:
+            ws_id = workspace["id"]
+            rpc_id = self._next_rpc_id()
+            self._subscription_rpc_ids[rpc_id] = ws_id
+
+            # Initialize per-workspace state
+            self._workspace_activities.setdefault(ws_id, {})
+            self._workspace_categories.setdefault(ws_id, {})
+            self._workspace_live_sessions.setdefault(ws_id, None)
+
+            request = {
+                "jsonrpc": "2.0",
+                "method": "Subscribe",
+                "params": {"workspaceId": ws_id},
+                "id": rpc_id,
             }
 
-            # Fire events based on session changes
-            self._fire_session_events(old_sessions, live_sessions, activities)
+            _LOGGER.debug("Subscribing to workspace %s (rpc_id=%d)", ws_id, rpc_id)
+            await self._ws.send_json(request)
 
-            return new_data
+    async def async_disconnect(self) -> None:
+        """Gracefully disconnect from the WebSocket."""
+        self._intentional_disconnect = True
 
-        except ConfigEntryAuthFailed:
-            # Re-raise to trigger reauth flow
-            raise
-        except aiohttp.ClientError as err:
-            raise UpdateFailed(
-                f"Error communicating with Drift Beacon API: {err}"
-            ) from err
-        except Exception as err:
-            raise UpdateFailed(f"Unexpected error: {err}") from err
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
 
-    async def start_session(self, activity_id: str, workspace_id: str) -> bool:
-        """Start a session for an activity."""
-        _LOGGER.debug("Starting session for activity %s in workspace %s", activity_id, workspace_id)
+        if self._ws and not self._ws.closed:
+            # Best-effort unsubscribe
+            for ws_id in [w["id"] for w in self._workspaces]:
+                try:
+                    rpc_id = self._next_rpc_id()
+                    await asyncio.wait_for(
+                        self._ws.send_json(
+                            {
+                                "jsonrpc": "2.0",
+                                "method": "Unsubscribe",
+                                "params": {"workspaceId": ws_id},
+                                "id": rpc_id,
+                            }
+                        ),
+                        timeout=2,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+            await self._ws.close()
+
+        self._ws = None
+
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
+            self._listen_task = None
+
+        # Clear pending responses
+        for future in self._pending_responses.values():
+            if not future.done():
+                future.cancel()
+        self._pending_responses.clear()
+        self._subscription_rpc_ids.clear()
+
+        self._available = False
+        self._notify_listeners()
+
+    # ========================================================================
+    # JSON-RPC Client
+    # ========================================================================
+
+    def _next_rpc_id(self) -> int:
+        """Get the next RPC request ID."""
+        self._rpc_id += 1
+        return self._rpc_id
+
+    async def _send_rpc(self, method: str, params: dict | None = None) -> Any:
+        """Send a JSON-RPC request and await the non-stream response."""
+        if self._ws is None or self._ws.closed:
+            raise ConnectionError("WebSocket is not connected")
+
+        rpc_id = self._next_rpc_id()
+        future: asyncio.Future = self.hass.loop.create_future()
+        self._pending_responses[rpc_id] = future
+
+        request = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or {},
+            "id": rpc_id,
+        }
+
+        _LOGGER.debug("Sending RPC: %s (id=%d)", method, rpc_id)
+        await self._ws.send_json(request)
 
         try:
-            await self._make_authenticated_request(
-                "POST",
-                API_START_SESSION,
-                json={"activityId": activity_id, "workspaceId": workspace_id},
-            )
-
-            _LOGGER.info("Successfully started session for activity %s", activity_id)
-
-            # Immediately refresh data to update entity states
-            await self.async_request_refresh()
-            return True
-
-        except ConfigEntryAuthFailed:
-            _LOGGER.error("Authentication failed while starting session")
-            # Re-raise to trigger reauth flow
+            return await asyncio.wait_for(future, timeout=API_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._pending_responses.pop(rpc_id, None)
             raise
-        except aiohttp.ClientResponseError as err:
-            _LOGGER.error(
-                "Failed to start session for activity %s: HTTP %s",
-                activity_id,
-                err.status,
-            )
-            return False
+
+    # ========================================================================
+    # Message Listening
+    # ========================================================================
+
+    async def _listen_loop(self) -> None:
+        """Main WebSocket message receive loop."""
+        if self._ws is None:
+            return
+
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    self._handle_message(msg.data)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    _LOGGER.error(
+                        "WebSocket error: %s", self._ws.exception()
+                    )
+                    break
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                ):
+                    break
+        except asyncio.CancelledError:
+            return
         except Exception as err:
-            _LOGGER.error(
-                "Failed to start session for activity %s: %s", activity_id, err
+            _LOGGER.error("WebSocket listen error: %s", err)
+
+        # Connection lost
+        if not self._intentional_disconnect:
+            _LOGGER.warning("WebSocket connection lost")
+            self._available = False
+            self._notify_listeners()
+            self._schedule_reconnect()
+
+    @callback
+    def _handle_message(self, raw: str) -> None:
+        """Parse a JSON-RPC response and route it."""
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            _LOGGER.warning("Received non-JSON WebSocket message")
+            return
+
+        # Check for errors
+        if "error" in data:
+            rpc_id = data.get("id")
+            error_msg = data["error"].get("message", "Unknown error")
+            _LOGGER.error("RPC error (id=%s): %s", rpc_id, error_msg)
+
+            if rpc_id and rpc_id in self._pending_responses:
+                self._pending_responses.pop(rpc_id).set_exception(
+                    Exception(f"RPC error: {error_msg}")
+                )
+            return
+
+        is_chunked = data.get("chunk", False)
+        rpc_id = data.get("id")
+
+        if is_chunked:
+            # Stream messages from Subscribe
+            workspace_id = self._subscription_rpc_ids.get(rpc_id)
+            if workspace_id is None:
+                _LOGGER.debug(
+                    "Received chunked message for unknown rpc_id=%s", rpc_id
+                )
+                return
+
+            results = data.get("result", [])
+            for msg in results:
+                self._apply_stream_message(msg, workspace_id)
+            self._notify_listeners()
+        else:
+            # Non-stream RPC response (ListWorkspaces, StartSession, etc.)
+            if rpc_id and rpc_id in self._pending_responses:
+                self._pending_responses.pop(rpc_id).set_result(
+                    data.get("result")
+                )
+
+    # ========================================================================
+    # Stream Message Handlers
+    # ========================================================================
+
+    def _apply_stream_message(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        """Apply a single stream message to local state."""
+        tag = msg.get("_tag")
+        if not tag:
+            return
+
+        handler = {
+            "Snapshot": self._apply_snapshot,
+            "ActivityCreated": self._apply_activity_created,
+            "ActivityUpdated": self._apply_activity_updated,
+            "ActivityDeleted": self._apply_activity_deleted,
+            "CategoryCreated": self._apply_category_created,
+            "CategoryUpdated": self._apply_category_updated,
+            "CategoryDeleted": self._apply_category_deleted,
+            "SessionStarted": self._apply_session_started,
+            "SessionEnded": self._apply_session_ended,
+        }.get(tag)
+
+        if handler:
+            handler(msg, workspace_id)
+        else:
+            _LOGGER.debug("Unknown stream message tag: %s", tag)
+
+    def _apply_snapshot(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        """Apply a Snapshot message — full state replacement for a workspace."""
+        activities_raw = msg.get("activities", [])
+        categories_raw = msg.get("categories", [])
+        live_session_raw = msg.get("liveSession")
+
+        self._workspace_activities[workspace_id] = {
+            a["id"]: _parse_activity(a) for a in activities_raw
+        }
+        self._workspace_categories[workspace_id] = {
+            c["id"]: _parse_category(c) for c in categories_raw
+        }
+        self._workspace_live_sessions[workspace_id] = (
+            _parse_live_session(live_session_raw) if live_session_raw else None
+        )
+
+        self._available = True
+        self._reconnect_attempt = 0
+
+        _LOGGER.debug(
+            "Snapshot received for workspace %s: %d activities, %d categories, live_session=%s",
+            workspace_id,
+            len(activities_raw),
+            len(categories_raw),
+            "yes" if live_session_raw else "no",
+        )
+
+    def _apply_activity_created(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        activity = _parse_activity(msg["activity"])
+        self._workspace_activities.setdefault(workspace_id, {})[
+            activity["id"]
+        ] = activity
+        _LOGGER.debug("Activity created: %s (%s)", activity["name"], activity["id"])
+
+    def _apply_activity_updated(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        activity = _parse_activity(msg["activity"])
+        self._workspace_activities.setdefault(workspace_id, {})[
+            activity["id"]
+        ] = activity
+        _LOGGER.debug("Activity updated: %s (%s)", activity["name"], activity["id"])
+
+    def _apply_activity_deleted(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        activity_id = msg["activityId"]
+        acts = self._workspace_activities.get(workspace_id, {})
+        acts.pop(activity_id, None)
+        _LOGGER.debug("Activity deleted: %s", activity_id)
+
+    def _apply_category_created(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        category = _parse_category(msg["category"])
+        self._workspace_categories.setdefault(workspace_id, {})[
+            category["id"]
+        ] = category
+
+    def _apply_category_updated(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        category = _parse_category(msg["category"])
+        self._workspace_categories.setdefault(workspace_id, {})[
+            category["id"]
+        ] = category
+
+    def _apply_category_deleted(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        cat_id = msg["categoryId"]
+        cats = self._workspace_categories.get(workspace_id, {})
+        cats.pop(cat_id, None)
+
+    def _apply_session_started(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        prev_session = self._workspace_live_sessions.get(workspace_id)
+        new_session = _parse_live_session(msg["session"])
+        self._workspace_live_sessions[workspace_id] = new_session
+
+        activity = self.get_activity(new_session["activity_id"])
+        workspace = self._get_workspace_by_id(workspace_id)
+
+        if activity and workspace:
+            category = self.get_category(activity.get("category_id"))
+
+            event_data: dict[str, Any] = {
+                "activity_id": activity["id"],
+                "activity_name": activity["name"],
+                "color": activity["color"],
+                "icon": activity["icon"],
+                "category_id": activity.get("category_id"),
+                "category_name": category["name"] if category else None,
+                "category_icon": category["icon"] if category else None,
+                "category_color": category["color"] if category else None,
+                "workspace_id": workspace["id"],
+                "workspace_name": workspace["name"],
+                "session_start_time": new_session["start_time"],
+            }
+
+            if prev_session and prev_session["activity_id"] != new_session["activity_id"]:
+                # Session changed (different activity)
+                prev_activity = self.get_activity(prev_session["activity_id"])
+                event_data["previous_activity_id"] = prev_session["activity_id"]
+                event_data["previous_activity_name"] = (
+                    prev_activity["name"] if prev_activity else None
+                )
+                self.hass.bus.async_fire(EVENT_SESSION_CHANGED, event_data)
+                _LOGGER.debug(
+                    "Session changed: %s -> %s",
+                    prev_activity["name"] if prev_activity else "unknown",
+                    activity["name"],
+                )
+            else:
+                self.hass.bus.async_fire(EVENT_SESSION_STARTED, event_data)
+                _LOGGER.debug("Session started: %s", activity["name"])
+
+    def _apply_session_ended(
+        self, msg: dict[str, Any], workspace_id: str
+    ) -> None:
+        session_id = msg["sessionId"]
+        activity_id = msg["activityId"]
+        self._workspace_live_sessions[workspace_id] = None
+
+        activity = self.get_activity(activity_id)
+        workspace = self._get_workspace_by_id(workspace_id)
+
+        if activity and workspace:
+            self.hass.bus.async_fire(
+                EVENT_SESSION_STOPPED,
+                {
+                    "activity_id": activity_id,
+                    "activity_name": activity["name"],
+                    "workspace_id": workspace["id"],
+                    "workspace_name": workspace["name"],
+                },
             )
+            _LOGGER.debug("Session ended: %s (session %s)", activity["name"], session_id)
+
+    # ========================================================================
+    # Actions
+    # ========================================================================
+
+    async def start_session(self, activity_id: str, workspace_id: str) -> bool:
+        """Start a span session for an activity via RPC."""
+        _LOGGER.debug(
+            "Starting session for activity %s in workspace %s",
+            activity_id,
+            workspace_id,
+        )
+        try:
+            await self._send_rpc(
+                "StartSession",
+                {"workspaceId": workspace_id, "activityId": activity_id},
+            )
+            return True
+        except Exception as err:
+            _LOGGER.error("Failed to start session: %s", err)
             return False
 
     async def stop_session(self, activity_id: str, workspace_id: str) -> bool:
-        """Stop the current session."""
-        _LOGGER.debug("Stopping session for activity %s in workspace %s", activity_id, workspace_id)
-
+        """Stop the live session for an activity via RPC."""
+        _LOGGER.debug(
+            "Stopping session for activity %s in workspace %s",
+            activity_id,
+            workspace_id,
+        )
         try:
-            await self._make_authenticated_request(
-                "POST",
-                API_STOP_SESSION,
-                json={"activityId": activity_id, "workspaceId": workspace_id},
+            await self._send_rpc(
+                "StopSession",
+                {"workspaceId": workspace_id, "activityId": activity_id},
             )
-
-            _LOGGER.info("Successfully stopped session for activity %s", activity_id)
-
-            # Immediately refresh data to update entity states
-            await self.async_request_refresh()
             return True
-
-        except ConfigEntryAuthFailed:
-            _LOGGER.error("Authentication failed while stopping session")
-            # Re-raise to trigger reauth flow
-            raise
-        except aiohttp.ClientResponseError as err:
-            _LOGGER.error(
-                "Failed to stop session for activity %s: HTTP %s",
-                activity_id,
-                err.status,
-            )
-            return False
         except Exception as err:
-            _LOGGER.error(
-                "Failed to stop session for activity %s: %s", activity_id, err
-            )
+            _LOGGER.error("Failed to stop session: %s", err)
             return False
 
-    def _fire_session_events(
-        self,
-        old_sessions: list[Session],
-        new_sessions: list[Session],
-        activities: list[Activity],
-    ) -> None:
-        """Fire events when session state changes across all workspaces."""
+    async def mark_activity(self, activity_id: str, workspace_id: str) -> bool:
+        """Mark a point activity via RPC."""
+        _LOGGER.debug(
+            "Marking activity %s in workspace %s", activity_id, workspace_id
+        )
+        try:
+            await self._send_rpc(
+                "Mark",
+                {"workspaceId": workspace_id, "activityId": activity_id},
+            )
+            return True
+        except Exception as err:
+            _LOGGER.error("Failed to mark activity: %s", err)
+            return False
 
-        def get_activity(activity_id: str | None) -> Activity | None:
-            """Helper to find activity by ID."""
-            if activity_id is None:
-                return None
-            for activity in activities:
-                if activity["id"] == activity_id:
-                    return activity
-            return None
+    # ========================================================================
+    # Reconnection
+    # ========================================================================
 
-        # Create lookup by session ID for easier comparison
-        old_sessions_by_id = {s["id"]: s for s in old_sessions}
-        new_sessions_by_id = {s["id"]: s for s in new_sessions}
+    def _schedule_reconnect(self) -> None:
+        """Schedule a reconnection with exponential backoff."""
+        if self._intentional_disconnect:
+            return
+        if self._reconnect_task and not self._reconnect_task.done():
+            return
 
-        # Detect new sessions (started)
-        for new_session in new_sessions:
-            if new_session["id"] not in old_sessions_by_id:
-                activity = get_activity(new_session.get("activity_id"))
-                if activity:
-                    _LOGGER.debug(
-                        "Firing session_started event for activity %s in workspace %s",
-                        activity["name"],
-                        new_session["workspace_name"]
-                    )
-                    self.hass.bus.async_fire(
-                        EVENT_SESSION_STARTED,
-                        {
-                            "activity_id": activity["id"],
-                            "activity_name": activity["name"],
-                            "color": activity["color"],
-                            "icon": activity["icon"],
-                            "category_id": activity.get("category_id"),
-                            "category_name": activity.get("category_name"),
-                            "category_icon": activity.get("category_icon"),
-                            "category_color": activity.get("category_color"),
-                            "workspace_id": new_session["workspace_id"],
-                            "workspace_name": new_session["workspace_name"],
-                            "session_start_time": new_session["start_time"],
-                        },
-                    )
+        self._reconnect_attempt += 1
+        delay = min(
+            WS_RECONNECT_MIN_DELAY * (2 ** self._reconnect_attempt),
+            WS_RECONNECT_MAX_DELAY,
+        )
 
-        # Detect stopped sessions
-        for old_session in old_sessions:
-            if old_session["id"] not in new_sessions_by_id:
-                activity = get_activity(old_session.get("activity_id"))
-                if activity:
-                    _LOGGER.debug(
-                        "Firing session_stopped event for activity %s in workspace %s",
-                        activity["name"],
-                        old_session["workspace_name"]
-                    )
-                    self.hass.bus.async_fire(
-                        EVENT_SESSION_STOPPED,
-                        {
-                            "activity_id": old_session["activity_id"],
-                            "activity_name": activity["name"],
-                            "workspace_id": old_session["workspace_id"],
-                            "workspace_name": old_session["workspace_name"],
-                        },
-                    )
+        _LOGGER.info(
+            "Scheduling reconnect attempt %d in %.1fs",
+            self._reconnect_attempt,
+            delay,
+        )
+        self._reconnect_task = self.hass.async_create_task(
+            self._reconnect(delay), f"{DOMAIN}_ws_reconnect"
+        )
 
-        # Detect changed sessions (same session ID, different activity)
-        for session_id in old_sessions_by_id:
-            if session_id in new_sessions_by_id:
-                old_session = old_sessions_by_id[session_id]
-                new_session = new_sessions_by_id[session_id]
+    async def _reconnect(self, delay: float) -> None:
+        """Wait and then reconnect."""
+        await asyncio.sleep(delay)
 
-                if old_session.get("activity_id") != new_session.get("activity_id"):
-                    old_activity = get_activity(old_session.get("activity_id"))
-                    new_activity = get_activity(new_session.get("activity_id"))
+        if self._intentional_disconnect:
+            return
 
-                    if new_activity:
-                        _LOGGER.debug(
-                            "Firing session_changed event in workspace %s: %s -> %s",
-                            new_session["workspace_name"],
-                            old_activity["name"] if old_activity else "unknown",
-                            new_activity["name"],
-                        )
-                        self.hass.bus.async_fire(
-                            EVENT_SESSION_CHANGED,
-                            {
-                                "activity_id": new_activity["id"],
-                                "activity_name": new_activity["name"],
-                                "color": new_activity["color"],
-                                "icon": new_activity["icon"],
-                                "category_id": new_activity.get("category_id"),
-                                "category_name": new_activity.get("category_name"),
-                                "category_icon": new_activity.get("category_icon"),
-                                "category_color": new_activity.get("category_color"),
-                                "workspace_id": new_session["workspace_id"],
-                                "workspace_name": new_session["workspace_name"],
-                                "session_start_time": new_session["start_time"],
-                                "previous_activity_id": old_session["activity_id"],
-                                "previous_activity_name": (
-                                    old_activity["name"] if old_activity else None
-                                ),
-                            },
-                        )
+        # Clean up old connection state
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
+        self._ws = None
+
+        if self._listen_task and not self._listen_task.done():
+            self._listen_task.cancel()
+            self._listen_task = None
+
+        for future in self._pending_responses.values():
+            if not future.done():
+                future.cancel()
+        self._pending_responses.clear()
+        self._subscription_rpc_ids.clear()
+
+        await self.async_connect()

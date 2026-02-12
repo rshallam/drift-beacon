@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from homeassistant.components.sensor import SensorEntity
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     ATTR_ACTIVITY_ID,
@@ -30,7 +29,7 @@ from .const import (
 from .coordinator import (
     Activity,
     DriftBeaconConfigEntry,
-    DriftBeaconDataUpdateCoordinator,
+    DriftBeaconWebSocketManager,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -42,24 +41,14 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up the Drift Beacon sensor platform."""
-    coordinator = entry.runtime_data
-
-    # Extract unique workspaces from activities
-    activities = coordinator.data.get("activities", [])
-    workspaces: dict[str, str] = {}  # workspace_id -> workspace_name
-
-    for activity in activities:
-        workspace_id = activity.get("workspace_id")
-        workspace_name = activity.get("workspace_name")
-        if workspace_id and workspace_name:
-            workspaces[workspace_id] = workspace_name
+    manager = entry.runtime_data
 
     # Create one live session sensor per workspace
     sensors = [
         DriftBeaconLiveSessionSensor(
-            coordinator, entry.entry_id, workspace_id, workspace_name
+            manager, entry.entry_id, workspace["id"], workspace["name"]
         )
-        for workspace_id, workspace_name in workspaces.items()
+        for workspace in manager.workspaces
     ]
 
     if sensors:
@@ -68,26 +57,24 @@ async def async_setup_entry(
         _LOGGER.warning("No workspaces found, no sensors created")
 
 
-class DriftBeaconLiveSessionSensor(
-    CoordinatorEntity[DriftBeaconDataUpdateCoordinator], SensorEntity
-):
+class DriftBeaconLiveSessionSensor(SensorEntity):
     """Sensor representing the live session state for a specific workspace."""
 
     _attr_has_entity_name = True
 
     def __init__(
         self,
-        coordinator: DriftBeaconDataUpdateCoordinator,
+        manager: DriftBeaconWebSocketManager,
         config_entry_id: str,
         workspace_id: str,
         workspace_name: str,
     ) -> None:
         """Initialize the sensor."""
-        super().__init__(coordinator)
-
+        self._manager = manager
         self._config_entry_id = config_entry_id
         self._workspace_id = workspace_id
         self._workspace_name = workspace_name
+        self._remove_listener: Callable | None = None
 
         # Set unique ID for entity registry (include workspace)
         self._attr_unique_id = f"{config_entry_id}_live_session_{workspace_id}"
@@ -100,16 +87,25 @@ class DriftBeaconLiveSessionSensor(
             "identifiers": {(DOMAIN, config_entry_id)},
         }
 
+    async def async_added_to_hass(self) -> None:
+        """Register listener when added to hass."""
+        self._remove_listener = self._manager.async_add_listener(
+            self.async_write_ha_state
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Remove listener when removed from hass."""
+        if self._remove_listener:
+            self._remove_listener()
+
     @property
     def native_value(self) -> str | None:
         """Return the activity name, or None if no active session in this workspace."""
-        # Get session for this workspace
-        session = self._get_workspace_session()
+        session = self._manager.get_live_session(self._workspace_id)
         if session is None:
             return None
 
-        # Find the activity for this session
-        activity = self._get_activity(session.get("activity_id"))
+        activity = self._manager.get_activity(session["activity_id"])
         if activity is None:
             return None
 
@@ -118,27 +114,25 @@ class DriftBeaconLiveSessionSensor(
     @property
     def icon(self) -> str:
         """Return the icon for the current activity."""
-        session = self._get_workspace_session()
+        session = self._manager.get_live_session(self._workspace_id)
         if session is None:
             return "mdi:circle"
 
-        # Find the activity for this session
-        activity = self._get_activity(session.get("activity_id"))
+        activity = self._manager.get_activity(session["activity_id"])
         if activity is None or not activity.get("icon"):
             return "mdi:circle"
 
-        # Icons are already formatted for HA (e.g., "mdi:brain")
         return activity["icon"]
 
     @property
     def available(self) -> bool:
         """Return True if entity is available."""
-        return self.coordinator.last_update_success
+        return self._manager.available
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return additional state attributes."""
-        session = self._get_workspace_session()
+        session = self._manager.get_live_session(self._workspace_id)
 
         # If no session in this workspace, return workspace info only
         if session is None:
@@ -148,15 +142,18 @@ class DriftBeaconLiveSessionSensor(
             }
 
         # Find the activity for this session
-        activity = self._get_activity(session.get("activity_id"))
+        activity = self._manager.get_activity(session["activity_id"])
         if activity is None:
             _LOGGER.warning(
-                "Activity %s not found for live session", session.get("activity_id")
+                "Activity %s not found for live session", session["activity_id"]
             )
             return {
                 ATTR_WORKSPACE_ID: self._workspace_id,
                 ATTR_WORKSPACE_NAME: self._workspace_name,
             }
+
+        # Look up category
+        category = self._manager.get_category(activity.get("category_id"))
 
         attributes = {
             ATTR_ACTIVITY_ID: activity["id"],
@@ -164,9 +161,9 @@ class DriftBeaconLiveSessionSensor(
             ATTR_COLOR: activity["color"],
             ATTR_ICON: activity["icon"],
             ATTR_CATEGORY_ID: activity.get("category_id"),
-            ATTR_CATEGORY_NAME: activity.get("category_name"),
-            ATTR_CATEGORY_ICON: activity.get("category_icon"),
-            ATTR_CATEGORY_COLOR: activity.get("category_color"),
+            ATTR_CATEGORY_NAME: category["name"] if category else None,
+            ATTR_CATEGORY_ICON: category["icon"] if category else None,
+            ATTR_CATEGORY_COLOR: category["color"] if category else None,
             ATTR_WORKSPACE_ID: self._workspace_id,
             ATTR_WORKSPACE_NAME: self._workspace_name,
             ATTR_SESSION_START_TIME: session["start_time"],
@@ -203,24 +200,3 @@ class DriftBeaconLiveSessionSensor(
             return f"{minutes}m {secs}s"
         else:
             return f"{secs}s"
-
-    def _get_workspace_session(self) -> dict[str, Any] | None:
-        """Get the active session for this workspace."""
-        live_sessions = self.coordinator.data.get("live_sessions", [])
-
-        for session in live_sessions:
-            if session.get("workspace_id") == self._workspace_id:
-                return session
-
-        return None
-
-    def _get_activity(self, activity_id: str | None) -> Activity | None:
-        """Get activity data by ID."""
-        if activity_id is None:
-            return None
-
-        activities = self.coordinator.data.get("activities", [])
-        for activity in activities:
-            if activity["id"] == activity_id:
-                return activity
-        return None
