@@ -11,6 +11,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     ATTR_ACTIVITY_ID,
+    ATTR_ACTIVITY_NAME,
     ATTR_CATEGORY_COLOR,
     ATTR_CATEGORY_ICON,
     ATTR_CATEGORY_ID,
@@ -30,6 +31,8 @@ from .coordinator import (
     Activity,
     DriftBeaconConfigEntry,
     DriftBeaconWebSocketManager,
+    LiveSession,
+    Workspace,
     hex_to_rgb,
 )
 
@@ -42,6 +45,10 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     manager = entry.runtime_data
+
+    # Workspace-level control: one button that stops whatever session is live.
+    async_add_entities([DriftBeaconStopSessionButton(manager, entry.entry_id)])
+
     entities: dict[str, DriftBeaconActivityButton] = {}
 
     @callback
@@ -82,6 +89,7 @@ class DriftBeaconActivityButton(ButtonEntity):
     """Representation of a point activity as a button."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_visible_default = False
 
     def __init__(
         self,
@@ -164,3 +172,73 @@ class DriftBeaconActivityButton(ButtonEntity):
     def _get_activity(self) -> Activity | None:
         """Get the activity data for this entity."""
         return self._manager.get_activity(self._activity_id)
+
+
+class DriftBeaconStopSessionButton(ButtonEntity):
+    """Workspace-level button that stops the currently live session, if any."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:stop-circle-outline"
+
+    def __init__(
+        self,
+        manager: DriftBeaconWebSocketManager,
+        config_entry_id: str,
+    ) -> None:
+        """Initialize the stop-session button."""
+        self._manager = manager
+        self._config_entry_id = config_entry_id
+        self._remove_listener: Callable | None = None
+
+        self._attr_unique_id = f"{config_entry_id}_stop_session"
+        self._attr_name = "Stop session"
+
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, config_entry_id)},
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Register listener when added to hass."""
+        self._remove_listener = self._manager.async_add_listener(
+            self.async_write_ha_state
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Remove listener when removed from hass."""
+        if self._remove_listener:
+            self._remove_listener()
+
+    @property
+    def available(self) -> bool:
+        """Return True whenever connected — pressing with no session is a no-op."""
+        return self._manager.available
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the current live session (if any) for dashboard convenience."""
+        workspace, session = self._get_live_context()
+        if workspace is None or session is None:
+            return {}
+
+        activity = self._manager.get_activity(session["activity_id"])
+        return {
+            ATTR_ACTIVITY_ID: session["activity_id"],
+            ATTR_ACTIVITY_NAME: activity["name"] if activity else None,
+            ATTR_WORKSPACE_ID: workspace["id"],
+            ATTR_WORKSPACE_NAME: workspace["name"],
+        }
+
+    async def async_press(self) -> None:
+        """Stop whatever session is live for the connection user."""
+        _LOGGER.debug("Stop-session button pressed")
+        success = await self._manager.stop_session()
+        if not success:
+            _LOGGER.error("Failed to stop live session")
+
+    def _get_live_context(self) -> tuple[Workspace | None, LiveSession | None]:
+        """Return the workspace and live session, if a session is currently live."""
+        for workspace in self._manager.workspaces:
+            session = self._manager.get_live_session(workspace["id"])
+            if session is not None:
+                return workspace, session
+        return None, None

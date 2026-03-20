@@ -20,7 +20,7 @@ API_SYSTEM_STATUS: Final = "/api/device/status"
 # WebSocket
 WS_PATH: Final = "/api/ws"
 WS_RECONNECT_MIN_DELAY: Final = 1  # seconds
-WS_RECONNECT_MAX_DELAY: Final = 30  # seconds
+WS_RECONNECT_MAX_DELAY: Final = 4  # seconds
 
 # Timeouts
 API_TIMEOUT: Final = 5  # seconds
@@ -41,6 +41,8 @@ PLATFORMS: Final = ["switch", "sensor", "button"]
 EVENT_SESSION_STARTED: Final = "drift_beacon_session_started"
 EVENT_SESSION_STOPPED: Final = "drift_beacon_session_stopped"
 EVENT_SESSION_CHANGED: Final = "drift_beacon_session_changed"
+EVENT_ACTIVITY_ARMED: Final = "drift_beacon_activity_armed"
+EVENT_ACTIVITY_DISARMED: Final = "drift_beacon_activity_disarmed"
 
 # Attributes
 ATTR_ACTIVITY_ID: Final = "activity_id"
@@ -61,3 +63,4 @@ ATTR_WORKSPACE_NAME: Final = "workspace_name"
 ATTR_SESSION_START_TIME: Final = "session_start_time"
 ATTR_SESSION_DURATION: Final = "session_duration"
 ATTR_SESSION_DURATION_FORMATTED: Final = "session_duration_formatted"
+ATTR_ARMED_AT: Final = "armed_at"

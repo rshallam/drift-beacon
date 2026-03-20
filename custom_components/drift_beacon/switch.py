@@ -12,6 +12,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     ATTR_ACTIVITY_ID,
+    ATTR_ARMED_AT,
     ATTR_CATEGORY_COLOR,
     ATTR_CATEGORY_ICON,
     ATTR_CATEGORY_ID,
@@ -45,8 +46,8 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     manager = entry.runtime_data
-    # Track entities by activity ID
-    entities: dict[str, DriftBeaconActivitySwitch] = {}
+    session_entities: dict[str, DriftBeaconActivitySwitch] = {}
+    armed_entities: dict[str, DriftBeaconArmedActivitySwitch] = {}
 
     @callback
     def _async_add_remove_entities() -> None:
@@ -58,7 +59,7 @@ async def async_setup_entry(
         ]
 
         current_activity_ids = {activity["id"] for activity in span_activities}
-        existing_ids = set(entities.keys())
+        existing_ids = set(session_entities.keys())
         new_ids = current_activity_ids - existing_ids
         deleted_ids = existing_ids - current_activity_ids
 
@@ -69,7 +70,7 @@ async def async_setup_entry(
                 entity = DriftBeaconActivitySwitch(
                     manager, activity, entry.entry_id
                 )
-                entities[activity["id"]] = entity
+                session_entities[activity["id"]] = entity
                 new_entities.append(entity)
 
         if new_entities:
@@ -77,7 +78,31 @@ async def async_setup_entry(
 
         # Remove entities for deleted activities
         for activity_id in deleted_ids:
-            entity = entities.pop(activity_id)
+            entity = session_entities.pop(activity_id)
+            hass.async_create_task(entity.async_remove())
+
+        armable_activities = [
+            activity
+            for activity in manager.activities
+            if not activity.get("archived", False)
+        ]
+
+        current_armable_ids = {activity["id"] for activity in armable_activities}
+        existing_armed_ids = set(armed_entities)
+        new_armed_entities = []
+        for activity in armable_activities:
+            if activity["id"] not in existing_armed_ids:
+                entity = DriftBeaconArmedActivitySwitch(
+                    manager, activity, entry.entry_id
+                )
+                armed_entities[activity["id"]] = entity
+                new_armed_entities.append(entity)
+
+        if new_armed_entities:
+            async_add_entities(new_armed_entities)
+
+        for activity_id in existing_armed_ids - current_armable_ids:
+            entity = armed_entities.pop(activity_id)
             hass.async_create_task(entity.async_remove())
 
     # Add initial entities
@@ -91,6 +116,7 @@ class DriftBeaconActivitySwitch(SwitchEntity):
     """Representation of an Activity as a switch."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_visible_default = False
 
     def __init__(
         self,
@@ -108,7 +134,7 @@ class DriftBeaconActivitySwitch(SwitchEntity):
         self._attr_unique_id = f"{config_entry_id}_{activity['id']}"
 
         # Set entity name
-        self._attr_name = activity["name"]
+        self._attr_name = f"{activity['name']} Session"
 
         # Link to device
         self._attr_device_info = {
@@ -228,6 +254,113 @@ class DriftBeaconActivitySwitch(SwitchEntity):
                 "Activity %s does not have active session, nothing to stop",
                 self._activity_id,
             )
+
+    def _get_activity(self) -> Activity | None:
+        """Get the activity data for this entity."""
+        return self._manager.get_activity(self._activity_id)
+
+
+class DriftBeaconArmedActivitySwitch(SwitchEntity):
+    """Switch that arms or disarms one activity."""
+
+    _attr_has_entity_name = True
+    _attr_entity_registry_visible_default = False
+
+    def __init__(
+        self,
+        manager: DriftBeaconWebSocketManager,
+        activity: Activity,
+        config_entry_id: str,
+    ) -> None:
+        """Initialize the armed activity switch."""
+        self._manager = manager
+        self._activity_id = activity["id"]
+        self._remove_listener: Callable | None = None
+        self._attr_unique_id = f"{config_entry_id}_armed_{activity['id']}"
+        self._attr_name = f"{activity['name']} Arm"
+        self._attr_device_info = {
+            "identifiers": {(DOMAIN, config_entry_id)},
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Register listener when added to Home Assistant."""
+        self._remove_listener = self._manager.async_add_listener(
+            self.async_write_ha_state
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Remove listener when removed from Home Assistant."""
+        if self._remove_listener:
+            self._remove_listener()
+
+    @property
+    def is_on(self) -> bool:
+        """Return whether this is the activity in the user's armed slot."""
+        workspace = self._manager.get_workspace_for_activity(self._activity_id)
+        if workspace is None:
+            return False
+        armed_activity = self._manager.get_armed_activity(workspace["id"])
+        return (
+            armed_activity is not None
+            and armed_activity["activity_id"] == self._activity_id
+        )
+
+    @property
+    def available(self) -> bool:
+        """Return whether armed activity controls are available."""
+        return self._manager.available and self._get_activity() is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return activity metadata and the armed timestamp."""
+        activity = self._get_activity()
+        if activity is None:
+            return {}
+
+        workspace = self._manager.get_workspace_for_activity(self._activity_id)
+        category = self._manager.get_category(activity.get("category_id"))
+        attributes = {
+            ATTR_ACTIVITY_ID: activity["id"],
+            ATTR_DESCRIPTION: activity["description"],
+            ATTR_CATEGORY_ID: activity.get("category_id"),
+            ATTR_CATEGORY_NAME: category["name"] if category else None,
+            ATTR_CATEGORY_ICON: category["icon"] if category else None,
+            ATTR_CATEGORY_COLOR: (
+                hex_to_rgb(category["color"]) if category else None
+            ),
+            ATTR_COLOR: hex_to_rgb(activity["color"]),
+            ATTR_ICON: activity["icon"],
+            ATTR_SORT_ORDER: activity["sort_order"],
+            ATTR_UNIT: activity.get("unit"),
+            ATTR_PROGRESS: activity["progress"]["current"],
+            ATTR_TARGET: activity["progress"]["target"],
+            ATTR_WORKSPACE_ID: workspace["id"] if workspace else None,
+            ATTR_WORKSPACE_NAME: workspace["name"] if workspace else None,
+        }
+
+        if workspace:
+            armed_activity = self._manager.get_armed_activity(workspace["id"])
+            if (
+                armed_activity is not None
+                and armed_activity["activity_id"] == self._activity_id
+            ):
+                attributes[ATTR_ARMED_AT] = armed_activity["armed_at"]
+
+        return attributes
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        """Arm this activity."""
+        success = await self._manager.arm_activity(self._activity_id)
+        if not success:
+            _LOGGER.error("Failed to arm activity %s", self._activity_id)
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        """Disarm this activity if it currently owns the armed slot."""
+        if not self.is_on:
+            return
+        success = await self._manager.disarm_activity(self._activity_id)
+        if not success:
+            _LOGGER.error("Failed to disarm activity %s", self._activity_id)
 
     def _get_activity(self) -> Activity | None:
         """Get the activity data for this entity."""

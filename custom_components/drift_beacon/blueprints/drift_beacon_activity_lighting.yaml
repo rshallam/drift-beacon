@@ -1,16 +1,21 @@
 blueprint:
   name: Drift Beacon Activity Lighting
   description: >
-    Event-driven automation for controlling lights based on Drift Beacon sessions.
-    Uses events instead of state changes for more advanced use cases and faster response.
+    Event-driven automation for controlling lights based on Drift Beacon sessions and
+    armed activities. 
+
+    Live session lighting always takes priority. Armed-activity lighting only applies
+    when no session is currently live.
 
     This blueprint listens to the following events:
     - `drift_beacon_session_started` - New session begins
     - `drift_beacon_session_changed` - Switch between activities
     - `drift_beacon_session_stopped` - Session ends
+    - `drift_beacon_activity_armed` - An activity becomes armed
+    - `drift_beacon_activity_disarmed` - The armed activity is cleared
 
   domain: automation
-  source_url: https://github.com/yourusername/drift-beacon/blob/main/ha-integration/blueprints/drift_beacon_activity_lighting_events.yaml
+  source_url: https://github.com/rshallam/drift-beacon/blob/main/ha-integration/blueprints/drift_beacon_activity_lighting_events.yaml
 
   input:
     target_lights:
@@ -21,10 +26,21 @@ blueprint:
           entity:
             - domain: light
 
-    brightness:
-      name: Brightness
-      description: Brightness level for the lights (0-100%)
+    session_brightness:
+      name: Session Brightness
+      description: Brightness level for the lights while a session is live (0-100%)
       default: 100
+      selector:
+        number:
+          min: 1
+          max: 100
+          unit_of_measurement: "%"
+          mode: slider
+
+    armed_brightness:
+      name: Armed Brightness
+      description: Brightness level for the lights when an activity is armed but no session is live (0-100%)
+      default: 5
       selector:
         number:
           min: 1
@@ -44,13 +60,6 @@ blueprint:
           mode: slider
           step: 0.5
 
-    turn_off_on_stop:
-      name: Turn Off Lights When Session Ends
-      description: Automatically turn off lights when you stop the session
-      default: true
-      selector:
-        boolean:
-
     off_transition:
       name: Turn Off Transition Time
       description: Time to transition when turning off lights (in seconds)
@@ -63,40 +72,6 @@ blueprint:
           mode: slider
           step: 0.5
 
-    activity_mode:
-      name: Mode
-      description: Choose how to filter which activities trigger this automation
-      default: exclude_mode
-      selector:
-        select:
-          options:
-            - label: ALL ACTIVITIES
-              value: exclude_mode
-            - label: SPECIFIC ACTIVITIES
-              value: include_mode
-
-    activity_exclude_entities:
-      name: "Activities to Exclude (MODE: ALL ACTIVITIES)"
-      description: Select activities that should NOT trigger lighting control (e.g., Break, Sleep)
-      default: []
-      selector:
-        entity:
-          multiple: true
-          filter:
-            - integration: drift_beacon
-              domain: switch
-
-    activity_include_entities:
-      name: "Activities to Include (MODE: SPECIFIC ACTIVITIES)"
-      description: Select which activities should trigger lighting control
-      default: []
-      selector:
-        entity:
-          multiple: true
-          filter:
-            - integration: drift_beacon
-              domain: switch
-
     disable_when:
       name: Disable When (Optional)
       description: Pause activity lighting when these conditions are met. Leave empty to always run.
@@ -108,32 +83,11 @@ mode: restart
 max_exceeded: silent
 
 variables:
-  turn_off_on_stop: !input turn_off_on_stop
-  brightness: !input brightness
+  session_brightness: !input session_brightness
+  armed_brightness: !input armed_brightness
   transition: !input transition
   off_transition: !input off_transition
-  activity_mode: !input activity_mode
-  activity_exclude_entities: !input activity_exclude_entities
-  activity_include_entities: !input activity_include_entities
   disable_conditions: !input disable_when
-  activity_exclude_names: >
-    {% set names = [] %}
-    {% for entity_id in activity_exclude_entities %}
-      {% set name = state_attr(entity_id, 'name') %}
-      {% if name %}
-        {% set names = names + [name] %}
-      {% endif %}
-    {% endfor %}
-    {{ names }}
-  activity_include_names: >
-    {% set names = [] %}
-    {% for entity_id in activity_include_entities %}
-      {% set name = state_attr(entity_id, 'name') %}
-      {% if name %}
-        {% set names = names + [name] %}
-      {% endif %}
-    {% endfor %}
-    {{ names }}
 
 trigger:
   - platform: event
@@ -148,20 +102,14 @@ trigger:
     event_type: drift_beacon_session_stopped
     id: session_stopped
 
-condition:
-  # Activity selection mode check
-  - condition: template
-    value_template: >
-      {% if trigger.id not in ['session_started', 'session_changed'] %}
-        true
-      {% else %}
-        {% set activity_name = trigger.event.data.activity_name %}
-        {% if activity_mode == 'include_mode' %}
-          {{ activity_name in activity_include_names }}
-        {% else %}
-          {{ activity_name not in activity_exclude_names }}
-        {% endif %}
-      {% endif %}
+  - platform: event
+    event_type: drift_beacon_activity_armed
+    id: activity_armed
+
+  - platform: event
+    event_type: drift_beacon_activity_disarmed
+    id: activity_disarmed
+
 action:
   - if: "{{ disable_conditions | length > 0 }}"
     then:
@@ -170,7 +118,7 @@ action:
         then: []  # Conditions met, skip automation
         else:
           - choose:
-              # Session started or changed -> Update lights with activity color
+              # Session started or changed -> session lighting (highest priority)
               - conditions:
                   - condition: or
                     conditions:
@@ -183,15 +131,49 @@ action:
                     target: !input target_lights
                     data:
                       rgb_color: "{{ trigger.event.data.color }}"
-                      brightness_pct: !input brightness
+                      brightness_pct: !input session_brightness
                       transition: !input transition
 
-              # Session stopped -> Turn off lights (if enabled)
+              # Session stopped -> armed lighting takes over if something is still
+              # armed, otherwise off
               - conditions:
                   - condition: trigger
                     id: session_stopped
+                sequence:
+                  - if: "{{ trigger.event.data.armed_activity_id is not none }}"
+                    then:
+                      - action: light.turn_on
+                        target: !input target_lights
+                        data:
+                          rgb_color: "{{ trigger.event.data.armed_color }}"
+                          brightness_pct: !input armed_brightness
+                          transition: !input transition
+                    else:
+                      - action: light.turn_off
+                        target: !input target_lights
+                        data:
+                          transition: !input off_transition
+
+              # Activity armed -> armed lighting, unless a session is already live
+              - conditions:
+                  - condition: trigger
+                    id: activity_armed
                   - condition: template
-                    value_template: "{{ turn_off_on_stop }}"
+                    value_template: "{{ not trigger.event.data.has_live_session }}"
+                sequence:
+                  - action: light.turn_on
+                    target: !input target_lights
+                    data:
+                      rgb_color: "{{ trigger.event.data.color }}"
+                      brightness_pct: !input armed_brightness
+                      transition: !input transition
+
+              # Activity disarmed -> off, unless a session is already live
+              - conditions:
+                  - condition: trigger
+                    id: activity_disarmed
+                  - condition: template
+                    value_template: "{{ not trigger.event.data.has_live_session }}"
                 sequence:
                   - action: light.turn_off
                     target: !input target_lights
@@ -200,7 +182,7 @@ action:
     else:
       # No disable conditions set, always run
       - choose:
-          # Session started or changed -> Update lights with activity color
+          # Session started or changed -> session lighting (highest priority)
           - conditions:
               - condition: or
                 conditions:
@@ -213,15 +195,49 @@ action:
                 target: !input target_lights
                 data:
                   rgb_color: "{{ trigger.event.data.color }}"
-                  brightness_pct: !input brightness
+                  brightness_pct: !input session_brightness
                   transition: !input transition
 
-          # Session stopped -> Turn off lights (if enabled)
+          # Session stopped -> armed lighting takes over if something is still
+          # armed, otherwise off
           - conditions:
               - condition: trigger
                 id: session_stopped
+            sequence:
+              - if: "{{ trigger.event.data.armed_activity_id is not none }}"
+                then:
+                  - action: light.turn_on
+                    target: !input target_lights
+                    data:
+                      rgb_color: "{{ trigger.event.data.armed_color }}"
+                      brightness_pct: !input armed_brightness
+                      transition: !input transition
+                else:
+                  - action: light.turn_off
+                    target: !input target_lights
+                    data:
+                      transition: !input off_transition
+
+          # Activity armed -> armed lighting, unless a session is already live
+          - conditions:
+              - condition: trigger
+                id: activity_armed
               - condition: template
-                value_template: "{{ turn_off_on_stop }}"
+                value_template: "{{ not trigger.event.data.has_live_session }}"
+            sequence:
+              - action: light.turn_on
+                target: !input target_lights
+                data:
+                  rgb_color: "{{ trigger.event.data.color }}"
+                  brightness_pct: !input armed_brightness
+                  transition: !input transition
+
+          # Activity disarmed -> off, unless a session is already live
+          - conditions:
+              - condition: trigger
+                id: activity_disarmed
+              - condition: template
+                value_template: "{{ not trigger.event.data.has_live_session }}"
             sequence:
               - action: light.turn_off
                 target: !input target_lights

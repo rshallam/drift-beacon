@@ -8,7 +8,6 @@ from typing import Any
 
 import aiohttp
 import voluptuous as vol
-
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -88,16 +87,13 @@ class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
             except aiohttp.ClientConnectionError:
                 errors["base"] = "cannot_connect"
             except aiohttp.ClientResponseError as err:
-                if err.status == 404:
+                if err.status in (401, 403):
+                    errors["base"] = "invalid_auth"
+                elif err.status == 404:
                     errors["base"] = "invalid_server"
                 else:
                     errors["base"] = "server_error"
-            except aiohttp.WSServerHandshakeError as err:
-                if err.status == 401:
-                    errors["base"] = "invalid_auth"
-                else:
-                    errors["base"] = "cannot_connect"
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
 
@@ -160,14 +156,14 @@ class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
                     },
                 )
 
-            except aiohttp.WSServerHandshakeError as err:
-                if err.status == 401:
+            except aiohttp.ClientResponseError as err:
+                if err.status in (401, 403):
                     errors["base"] = "invalid_auth"
                 else:
                     errors["base"] = "cannot_connect"
             except aiohttp.ClientConnectionError:
                 errors["base"] = "cannot_connect"
-            except Exception:  # noqa: BLE001
+            except Exception:
                 _LOGGER.exception("Unexpected exception during reauth")
                 errors["base"] = "unknown"
 

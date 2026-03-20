@@ -17,7 +17,7 @@
       },
       "reauth_confirm": {
         "title": "Reauthenticate",
-        "description": "Your access token is invalid or expired. Please enter a new token.",
+        "description": "Your access token is invalid, expired, or no longer grants access to its workspace. Please enter a new token.",
         "data": {
           "api_token": "Access Token"
         }
@@ -25,7 +25,7 @@
     },
     "error": {
       "cannot_connect": "Unable to connect to Drift Beacon server. Please check the host and port.",
-      "invalid_auth": "Invalid access token. Please check your token and try again.",
+      "invalid_auth": "Invalid access token or workspace access denied. Please check your token and try again.",
       "invalid_server": "Server does not appear to be a Drift Beacon server. Please verify the address.",
       "server_error": "The server returned an error. Please check the server logs.",
       "unknown": "An unexpected error occurred. Please check the logs."
