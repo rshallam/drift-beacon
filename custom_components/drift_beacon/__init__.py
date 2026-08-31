@@ -10,7 +10,14 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 
-from .const import CONF_API_TOKEN, CONF_HOST, CONF_HUB_ID, CONF_HUB_NAME, CONF_PORT, CONF_PROTOCOL, DOMAIN
+from .const import (
+    CONF_HOST,
+    CONF_PORT,
+    CONF_PROTOCOL,
+    CONF_WORKSPACE_ID,
+    CONF_WORKSPACE_NAME,
+    DOMAIN,
+)
 from .coordinator import DriftBeaconWebSocketManager
 
 if TYPE_CHECKING:
@@ -22,35 +29,22 @@ PLATFORMS = [Platform.SWITCH, Platform.SENSOR, Platform.BUTTON]
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Migrate config entries from older versions."""
-    if entry.version == 1:
-        _LOGGER.debug("Migrating config entry from version 1 to 2")
-
-        # V1 used email/password auth with server session tokens.
-        # V2 uses pre-created API tokens. We can't derive an API token
-        # from the old session token, so keep what we can and trigger reauth.
-        new_data = {
-            CONF_HOST: entry.data.get(CONF_HOST, ""),
-            CONF_PORT: entry.data.get(CONF_PORT, 9000),
-            CONF_PROTOCOL: entry.data.get(CONF_PROTOCOL, "https"),
-            CONF_API_TOKEN: "",  # Empty — will trigger reauth
-            CONF_HUB_ID: entry.data.get(CONF_HUB_ID, ""),
-            CONF_HUB_NAME: entry.data.get(CONF_HUB_NAME, ""),
-        }
-
-        hass.config_entries.async_update_entry(entry, data=new_data, version=2)
-
-        # Trigger reauth so the user can provide a new API token
-        entry.async_start_reauth(hass)
-
-        _LOGGER.info("Migration to version 2 complete — reauthentication required")
-
+    """Reject legacy entries; workspace identity requires a clean setup."""
+    if entry.version < 3:
+        _LOGGER.error(
+            "Drift Beacon config entry %s predates workspace-scoped identity; "
+            "remove it and add each workspace again",
+            entry.entry_id,
+        )
+        return False
     return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: DriftBeaconConfigEntry) -> bool:
     host = entry.data[CONF_HOST]
     port = entry.data[CONF_PORT]
+    workspace_id = entry.data[CONF_WORKSPACE_ID]
+    workspace_name = entry.data[CONF_WORKSPACE_NAME]
 
     _LOGGER.debug("Setting up Drift Beacon integration for %s:%s", host, port)
 
@@ -61,14 +55,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: DriftBeaconConfigEntry) 
     # Store manager in runtime data
     entry.runtime_data = manager
 
-    # Create device registry entry for the Drift Beacon server
+    # Create one virtual device for this workspace
     device_registry = dr.async_get(hass)
     device_registry.async_get_or_create(
         config_entry_id=entry.entry_id,
-        identifiers={(DOMAIN, entry.entry_id)},
-        name="Drift Beacon",
+        identifiers={(DOMAIN, workspace_id)},
+        name=workspace_name,
         manufacturer="Drift Beacon",
-        configuration_url=f"http://{host}:{port}",
+        configuration_url=f"{entry.data[CONF_PROTOCOL]}://{host}:{port}",
     )
 
     # Setup platforms

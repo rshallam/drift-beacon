@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.core import HomeAssistant, callback
@@ -19,13 +20,12 @@ from .const import (
     ATTR_COLOR,
     ATTR_DESCRIPTION,
     ATTR_ICON,
+    ATTR_PROGRESS,
     ATTR_SORT_ORDER,
     ATTR_TARGET,
     ATTR_UNIT,
-    ATTR_PROGRESS,
     ATTR_WORKSPACE_ID,
     ATTR_WORKSPACE_NAME,
-    DOMAIN,
 )
 from .coordinator import (
     Activity,
@@ -47,7 +47,7 @@ async def async_setup_entry(
     manager = entry.runtime_data
 
     # Workspace-level control: one button that stops whatever session is live.
-    async_add_entities([DriftBeaconStopSessionButton(manager, entry.entry_id)])
+    async_add_entities([DriftBeaconStopSessionButton(manager)])
 
     entities: dict[str, DriftBeaconActivityButton] = {}
 
@@ -56,7 +56,8 @@ async def async_setup_entry(
         """Add new entities and remove deleted ones."""
         # Only create buttons for point activities (not archived)
         point_activities = [
-            a for a in manager.activities
+            a
+            for a in manager.activities
             if a.get("tracking_type") == "point" and not a.get("archived", False)
         ]
 
@@ -68,9 +69,7 @@ async def async_setup_entry(
         new_entities = []
         for activity in point_activities:
             if activity["id"] in new_ids:
-                entity = DriftBeaconActivityButton(
-                    manager, activity, entry.entry_id
-                )
+                entity = DriftBeaconActivityButton(manager, activity)
                 entities[activity["id"]] = entity
                 new_entities.append(entity)
 
@@ -95,20 +94,15 @@ class DriftBeaconActivityButton(ButtonEntity):
         self,
         manager: DriftBeaconWebSocketManager,
         activity: Activity,
-        config_entry_id: str,
     ) -> None:
         """Initialize the button."""
         self._manager = manager
         self._activity_id = activity["id"]
-        self._config_entry_id = config_entry_id
         self._remove_listener: Callable | None = None
 
-        self._attr_unique_id = f"{config_entry_id}_{activity['id']}"
+        self._attr_unique_id = f"{manager.workspace_id}:mark:{activity['id']}"
         self._attr_name = activity["name"]
-
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, config_entry_id)},
-        }
+        self._attr_device_info = manager.device_info
 
     async def async_added_to_hass(self) -> None:
         """Register listener when added to hass."""
@@ -153,6 +147,7 @@ class DriftBeaconActivityButton(ButtonEntity):
             ATTR_TARGET: activity["progress"]["target"],
             ATTR_WORKSPACE_ID: workspace["id"] if workspace else None,
             ATTR_WORKSPACE_NAME: workspace["name"] if workspace else None,
+            **self._manager.user_attributes,
         }
 
     async def async_press(self) -> None:
@@ -161,7 +156,9 @@ class DriftBeaconActivityButton(ButtonEntity):
 
         workspace = self._manager.get_workspace_for_activity(self._activity_id)
         if workspace is None:
-            _LOGGER.error("Cannot mark activity %s - workspace not found", self._activity_id)
+            _LOGGER.error(
+                "Cannot mark activity %s - workspace not found", self._activity_id
+            )
             return
 
         success = await self._manager.mark_activity(self._activity_id)
@@ -183,19 +180,14 @@ class DriftBeaconStopSessionButton(ButtonEntity):
     def __init__(
         self,
         manager: DriftBeaconWebSocketManager,
-        config_entry_id: str,
     ) -> None:
         """Initialize the stop-session button."""
         self._manager = manager
-        self._config_entry_id = config_entry_id
         self._remove_listener: Callable | None = None
 
-        self._attr_unique_id = f"{config_entry_id}_stop_session"
+        self._attr_unique_id = f"{manager.workspace_id}:stop_session"
         self._attr_name = "Stop session"
-
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, config_entry_id)},
-        }
+        self._attr_device_info = manager.device_info
 
     async def async_added_to_hass(self) -> None:
         """Register listener when added to hass."""
@@ -218,7 +210,7 @@ class DriftBeaconStopSessionButton(ButtonEntity):
         """Expose the current live session (if any) for dashboard convenience."""
         workspace, session = self._get_live_context()
         if workspace is None or session is None:
-            return {}
+            return self._manager.user_attributes
 
         activity = self._manager.get_activity(session["activity_id"])
         return {
@@ -226,6 +218,7 @@ class DriftBeaconStopSessionButton(ButtonEntity):
             ATTR_ACTIVITY_NAME: activity["name"] if activity else None,
             ATTR_WORKSPACE_ID: workspace["id"],
             ATTR_WORKSPACE_NAME: workspace["name"],
+            **self._manager.user_attributes,
         }
 
     async def async_press(self) -> None:

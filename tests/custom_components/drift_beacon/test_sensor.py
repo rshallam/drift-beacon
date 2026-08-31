@@ -16,7 +16,13 @@ class FakeManager:
         self.workspaces = []
         self.listeners = []
         self.available = True
-        self.armed_activity = None
+        self.workspace_id = "workspace-1"
+        self.device_info = {"identifiers": {("drift_beacon", self.workspace_id)}}
+        self.user_id = "user-1"
+        self.user_name = "Rich"
+        self.user_attributes = {"user_id": self.user_id, "user_name": self.user_name}
+        self.workspace_name = "Personal"
+        self.pinned_activity = None
         self.activity = {
             "id": "activity-1",
             "name": "Focus",
@@ -32,9 +38,9 @@ class FakeManager:
         self.listeners.append(listener)
         return lambda: self.listeners.remove(listener)
 
-    def get_armed_activity(self, workspace_id: str):
-        """Return current armed state."""
-        return self.armed_activity
+    def get_pinned_activity(self, workspace_id: str):
+        """Return current pinned state."""
+        return self.pinned_activity
 
     def get_activity(self, activity_id: str):
         """Return the test activity."""
@@ -42,7 +48,7 @@ class FakeManager:
 
     def get_category(self, category_id: str | None):
         """Return no category."""
-        return None
+        return
 
 
 class FakeEntry:
@@ -81,26 +87,34 @@ async def test_sensor_created_when_workspace_snapshot_arrives_late() -> None:
         entry,
         add_entities,
     )
-    assert added_entities == []
+    assert {entity.unique_id for entity in added_entities} == {
+        "workspace-1:connected_user"
+    }
 
     manager.workspaces = [{"id": "workspace-1", "name": "Personal"}]
     for listener in list(manager.listeners):
         listener()
 
     assert {entity.unique_id for entity in added_entities} == {
-        "entry-1_live_session_workspace-1",
-        "entry-1_armed_activity_workspace-1",
+        "workspace-1:connected_user",
+        "workspace-1:session",
+        "workspace-1:pinned_activity",
+    }
+    assert {entity.name for entity in added_entities} == {
+        "Connected user",
+        "Session",
+        "Pinned activity",
     }
 
 
 @pytest.mark.asyncio
-async def test_armed_sensor_exposes_current_activity() -> None:
-    """Armed sensor should expose the current activity and timestamp."""
+async def test_pinned_sensor_exposes_current_activity() -> None:
+    """Pinned sensor should expose the current activity and timestamp."""
     manager = FakeManager()
     manager.workspaces = [{"id": "workspace-1", "name": "Personal"}]
-    manager.armed_activity = {
+    manager.pinned_activity = {
         "activity_id": "activity-1",
-        "armed_at": "2026-08-14T10:00:00.000Z",
+        "pinned_at": "2026-08-14T10:00:00.000Z",
     }
     entry = FakeEntry(manager)
     added_entities = []
@@ -111,13 +125,22 @@ async def test_armed_sensor_exposes_current_activity() -> None:
         lambda entities: added_entities.extend(entities),
     )
 
-    armed_sensor = next(
+    pinned_sensor = next(
         entity
         for entity in added_entities
-        if entity.unique_id == "entry-1_armed_activity_workspace-1"
+        if entity.unique_id == "workspace-1:pinned_activity"
     )
-    assert armed_sensor.native_value == "Focus"
-    assert armed_sensor.icon == "mdi:target"
-    assert armed_sensor.extra_state_attributes["armed_at"] == (
+    assert pinned_sensor.native_value == "Focus"
+    assert pinned_sensor.icon == "mdi:target"
+    assert pinned_sensor.extra_state_attributes["pinned_at"] == (
         "2026-08-14T10:00:00.000Z"
     )
+    assert pinned_sensor.extra_state_attributes["user_id"] == "user-1"
+    assert pinned_sensor.extra_state_attributes["user_name"] == "Rich"
+    connected_user = next(
+        entity
+        for entity in added_entities
+        if entity.unique_id == "workspace-1:connected_user"
+    )
+    assert connected_user.native_value == "Rich"
+    assert connected_user.extra_state_attributes == {"user_id": "user-1"}

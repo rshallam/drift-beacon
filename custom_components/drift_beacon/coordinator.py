@@ -13,6 +13,7 @@ import aiohttp
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
@@ -21,9 +22,13 @@ from .const import (
     CONF_HOST,
     CONF_PORT,
     CONF_PROTOCOL,
+    CONF_USER_ID,
+    CONF_USER_NAME,
+    CONF_WORKSPACE_ID,
+    CONF_WORKSPACE_NAME,
     DOMAIN,
-    EVENT_ACTIVITY_ARMED,
-    EVENT_ACTIVITY_DISARMED,
+    EVENT_ACTIVITY_PINNED,
+    EVENT_ACTIVITY_UNPINNED,
     EVENT_SESSION_CHANGED,
     EVENT_SESSION_STARTED,
     EVENT_SESSION_STOPPED,
@@ -92,11 +97,11 @@ class LiveSession(TypedDict):
     start_time: str  # ISO 8601
 
 
-class ArmedActivity(TypedDict):
-    """Armed activity data from WebSocket API."""
+class PinnedActivity(TypedDict):
+    """Pinned activity data from WebSocket API."""
 
     activity_id: str
-    armed_at: str  # ISO 8601
+    pinned_at: str  # ISO 8601
 
 
 type DriftBeaconConfigEntry = ConfigEntry["DriftBeaconWebSocketManager"]
@@ -164,11 +169,11 @@ def _parse_live_session(data: dict[str, Any]) -> LiveSession:
     )
 
 
-def _parse_armed_activity(data: dict[str, Any]) -> ArmedActivity:
-    """Parse a raw armed activity dict from the WebSocket API."""
-    return ArmedActivity(
+def _parse_pinned_activity(data: dict[str, Any]) -> PinnedActivity:
+    """Parse a raw pinned activity dict from the WebSocket API."""
+    return PinnedActivity(
         activity_id=data.get("activityId", ""),
-        armed_at=data.get("armedAt", ""),
+        pinned_at=data.get("pinnedAt", ""),
     )
 
 
@@ -190,13 +195,17 @@ class DriftBeaconWebSocketManager:
         self.host: str = entry.data[CONF_HOST]
         self.port: int = entry.data[CONF_PORT]
         self.protocol: str = entry.data.get(CONF_PROTOCOL, "https")
+        self.workspace_id: str = entry.data[CONF_WORKSPACE_ID]
+        self.workspace_name: str = entry.data[CONF_WORKSPACE_NAME]
+        self.user_id: str = entry.data[CONF_USER_ID]
+        self.user_name: str = entry.data[CONF_USER_NAME]
 
-        # State per workspace (kept for future multi-workspace support)
+        # State for this config entry's workspace
         self._workspaces: list[Workspace] = []
         self._workspace_activities: dict[str, dict[str, Activity]] = {}
         self._workspace_categories: dict[str, dict[str, Category]] = {}
         self._workspace_live_sessions: dict[str, LiveSession | None] = {}
-        self._workspace_armed_activities: dict[str, ArmedActivity | None] = {}
+        self._workspace_pinned_activities: dict[str, PinnedActivity | None] = {}
 
         # Connection
         self._ws: aiohttp.ClientWebSocketResponse | None = None
@@ -220,6 +229,16 @@ class DriftBeaconWebSocketManager:
     def available(self) -> bool:
         """Return True when connected and data has been received."""
         return self._available
+
+    @property
+    def device_info(self) -> dict[str, Any]:
+        """Return the virtual workspace device shared by all entities."""
+        return {"identifiers": {(DOMAIN, self.workspace_id)}}
+
+    @property
+    def user_attributes(self) -> dict[str, str]:
+        """Return the token owner's public entity attributes."""
+        return {"user_id": self.user_id, "user_name": self.user_name}
 
     @property
     def workspaces(self) -> list[Workspace]:
@@ -261,9 +280,13 @@ class DriftBeaconWebSocketManager:
         """Get the live session for a workspace."""
         return self._workspace_live_sessions.get(workspace_id)
 
-    def get_armed_activity(self, workspace_id: str) -> ArmedActivity | None:
-        """Get the armed activity for a workspace."""
-        return self._workspace_armed_activities.get(workspace_id)
+    def get_pinned_activity(self, workspace_id: str) -> PinnedActivity | None:
+        """Get the pinned activity for a workspace."""
+        return self._workspace_pinned_activities.get(workspace_id)
+
+    def get_activities(self, workspace_id: str) -> list[Activity]:
+        """Return activities belonging to one workspace."""
+        return list(self._workspace_activities.get(workspace_id, {}).values())
 
     def _get_workspace_by_id(self, workspace_id: str) -> Workspace | None:
         """Get a workspace by its ID."""
@@ -395,16 +418,14 @@ class DriftBeaconWebSocketManager:
                     )
                     self.config_entry.async_start_reauth(self.hass)
                 return
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:  # noqa: BLE001  # noqa: BLE001
                 await self._cleanup_connection(
                     ConnectionError(f"WebSocket connection lost: {err}")
                 )
 
                 if self._initial_ready and not self._initial_ready.done():
                     self._initial_ready.set_exception(
-                        ConfigEntryNotReady(
-                            f"Unable to connect to Drift Beacon: {err}"
-                        )
+                        ConfigEntryNotReady(f"Unable to connect to Drift Beacon: {err}")
                     )
                     return
 
@@ -450,7 +471,7 @@ class DriftBeaconWebSocketManager:
                     ),
                     timeout=2,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception:  # noqa: BLE001, S110
                 pass
 
         connection_task = self._connection_task
@@ -472,7 +493,7 @@ class DriftBeaconWebSocketManager:
         if ws and not ws.closed:
             try:
                 await ws.close()
-            except Exception as err:  # noqa: BLE001
+            except Exception as err:  # noqa: BLE001  # noqa: BLE001
                 _LOGGER.debug("Error while closing WebSocket: %s", err)
 
         for future in self._pending_responses.values():
@@ -585,9 +606,7 @@ class DriftBeaconWebSocketManager:
         if is_chunked:
             # Stream messages from Subscribe
             if rpc_id != self._subscription_rpc_id:
-                _LOGGER.debug(
-                    "Received chunked message for unknown rpc_id=%s", rpc_id
-                )
+                _LOGGER.debug("Received chunked message for unknown rpc_id=%s", rpc_id)
                 return
 
             results = data.get("result", [])
@@ -597,9 +616,7 @@ class DriftBeaconWebSocketManager:
         else:
             # Non-stream RPC response (StartSession, StopSession, etc.)
             if rpc_id and rpc_id in self._pending_responses:
-                self._pending_responses.pop(rpc_id).set_result(
-                    data.get("result")
-                )
+                self._pending_responses.pop(rpc_id).set_result(data.get("result"))
 
     # ========================================================================
     # Stream Message Handlers
@@ -621,7 +638,7 @@ class DriftBeaconWebSocketManager:
             "CategoryDeleted": self._apply_category_deleted,
             "SessionStarted": self._apply_session_started,
             "SessionEnded": self._apply_session_ended,
-            "ArmedActivityChanged": self._apply_armed_activity_changed,
+            "PinnedActivityChanged": self._apply_pinned_activity_changed,
         }.get(tag)
 
         if handler:
@@ -633,6 +650,13 @@ class DriftBeaconWebSocketManager:
         """Apply a Snapshot message — full state replacement for the workspace."""
         workspace_id = msg.get("workspaceId", "")
         workspace_name = msg.get("workspaceName", workspace_id)
+        user_id = msg.get("userId", "")
+        user_name = msg.get("userName", user_id)
+        if workspace_id != self.workspace_id:
+            raise ConfigEntryAuthFailed(
+                "The API token resolved to a different Drift Beacon workspace"
+            )
+        self._refresh_connection_metadata(workspace_name, user_id, user_name)
 
         # Populate workspace list from Snapshot
         self._workspaces = [Workspace(id=workspace_id, name=workspace_name)]
@@ -643,14 +667,14 @@ class DriftBeaconWebSocketManager:
         # to one workspace/user, so at most one entry is relevant.
         live_sessions_raw = msg.get("liveSessions", [])
         live_session_raw = live_sessions_raw[0] if live_sessions_raw else None
-        armed_activity_raw = msg.get("armedActivity")
+        pinned_activity_raw = msg.get("pinnedActivity")
 
         # The API token scopes Subscribe to one workspace, so each Snapshot
         # replaces all state retained from the previous connection.
         self._workspace_activities.clear()
         self._workspace_categories.clear()
         self._workspace_live_sessions.clear()
-        self._workspace_armed_activities.clear()
+        self._workspace_pinned_activities.clear()
 
         self._workspace_activities[workspace_id] = {
             a["id"]: _parse_activity(a) for a in activities_raw
@@ -661,37 +685,60 @@ class DriftBeaconWebSocketManager:
         self._workspace_live_sessions[workspace_id] = (
             _parse_live_session(live_session_raw) if live_session_raw else None
         )
-        self._workspace_armed_activities[workspace_id] = (
-            _parse_armed_activity(armed_activity_raw) if armed_activity_raw else None
+        self._workspace_pinned_activities[workspace_id] = (
+            _parse_pinned_activity(pinned_activity_raw) if pinned_activity_raw else None
         )
 
         self._available = True
         self._reconnect_attempt = 0
 
         _LOGGER.debug(
-            "Snapshot received for workspace %s (%s): %d activities, %d categories, live_session=%s, armed_activity=%s",
+            "Snapshot received for workspace %s (%s): %d activities, %d categories, live_session=%s, pinned_activity=%s",
             workspace_name,
             workspace_id,
             len(activities_raw),
             len(categories_raw),
             "yes" if live_session_raw else "no",
-            armed_activity_raw.get("activityId") if armed_activity_raw else "none",
+            pinned_activity_raw.get("activityId") if pinned_activity_raw else "none",
         )
+
+    def _refresh_connection_metadata(
+        self, workspace_name: str, user_id: str, user_name: str
+    ) -> None:
+        """Refresh friendly names while preserving workspace identity."""
+        self.workspace_name = workspace_name
+        self.user_id = user_id
+        self.user_name = user_name
+        new_data = {
+            **self.config_entry.data,
+            CONF_WORKSPACE_NAME: workspace_name,
+            CONF_USER_ID: user_id,
+            CONF_USER_NAME: user_name,
+        }
+        if (
+            new_data != self.config_entry.data
+            or self.config_entry.title != workspace_name
+        ):
+            self.hass.config_entries.async_update_entry(
+                self.config_entry, data=new_data, title=workspace_name
+            )
+        device_registry = dr.async_get(self.hass)
+        device = device_registry.async_get_device(
+            identifiers={(DOMAIN, self.workspace_id)}
+        )
+        if device is not None and device.name != workspace_name:
+            device_registry.async_update_device(device.id, name=workspace_name)
 
     def _apply_activity_created(self, msg: dict[str, Any]) -> None:
         activity = _parse_activity(msg["activity"])
         ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        self._workspace_activities.setdefault(ws_id, {})[
-            activity["id"]
-        ] = activity
+        self._workspace_activities.setdefault(ws_id, {})[activity["id"]] = activity
         _LOGGER.debug("Activity created: %s (%s)", activity["name"], activity["id"])
 
     def _apply_activity_updated(self, msg: dict[str, Any]) -> None:
         activity = _parse_activity(msg["activity"])
         ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        self._workspace_activities.setdefault(ws_id, {})[
-            activity["id"]
-        ] = activity
+        self._workspace_activities.setdefault(ws_id, {})[activity["id"]] = activity
         _LOGGER.debug("Activity updated: %s (%s)", activity["name"], activity["id"])
 
     def _apply_activity_deleted(self, msg: dict[str, Any]) -> None:
@@ -704,16 +751,12 @@ class DriftBeaconWebSocketManager:
     def _apply_category_created(self, msg: dict[str, Any]) -> None:
         category = _parse_category(msg["category"])
         ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        self._workspace_categories.setdefault(ws_id, {})[
-            category["id"]
-        ] = category
+        self._workspace_categories.setdefault(ws_id, {})[category["id"]] = category
 
     def _apply_category_updated(self, msg: dict[str, Any]) -> None:
         category = _parse_category(msg["category"])
         ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        self._workspace_categories.setdefault(ws_id, {})[
-            category["id"]
-        ] = category
+        self._workspace_categories.setdefault(ws_id, {})[category["id"]] = category
 
     def _apply_category_deleted(self, msg: dict[str, Any]) -> None:
         cat_id = msg["categoryId"]
@@ -747,7 +790,10 @@ class DriftBeaconWebSocketManager:
                 "session_start_time": new_session["start_time"],
             }
 
-            if prev_session and prev_session["activity_id"] != new_session["activity_id"]:
+            if (
+                prev_session
+                and prev_session["activity_id"] != new_session["activity_id"]
+            ):
                 # Session changed (different activity)
                 prev_activity = self.get_activity(prev_session["activity_id"])
                 event_data["previous_activity_id"] = prev_session["activity_id"]
@@ -774,11 +820,13 @@ class DriftBeaconWebSocketManager:
         activity = self.get_activity(activity_id)
 
         if activity and workspace:
-            # Include the currently armed activity (if any) so automations can
-            # fall back to armed lighting instead of turning off outright —
+            # Include the currently pinned activity (if any) so automations can
+            # fall back to pinned lighting instead of turning off outright —
             # session lighting always took priority while the session was live.
-            armed = self.get_armed_activity(workspace["id"])
-            armed_activity = self.get_activity(armed["activity_id"]) if armed else None
+            pinned = self.get_pinned_activity(workspace["id"])
+            pinned_activity = (
+                self.get_activity(pinned["activity_id"]) if pinned else None
+            )
 
             self.hass.bus.async_fire(
                 EVENT_SESSION_STOPPED,
@@ -787,31 +835,35 @@ class DriftBeaconWebSocketManager:
                     "activity_name": activity["name"],
                     "workspace_id": workspace["id"],
                     "workspace_name": workspace["name"],
-                    "armed_activity_id": armed["activity_id"] if armed else None,
-                    "armed_activity_name": (
-                        armed_activity["name"] if armed_activity else None
+                    "pinned_activity_id": pinned["activity_id"] if pinned else None,
+                    "pinned_activity_name": (
+                        pinned_activity["name"] if pinned_activity else None
                     ),
-                    "armed_color": (
-                        hex_to_rgb(armed_activity["color"]) if armed_activity else None
+                    "pinned_color": (
+                        hex_to_rgb(pinned_activity["color"])
+                        if pinned_activity
+                        else None
                     ),
                 },
             )
-            _LOGGER.debug("Session ended: %s (session %s)", activity["name"], session_id)
+            _LOGGER.debug(
+                "Session ended: %s (session %s)", activity["name"], session_id
+            )
 
-    def _apply_armed_activity_changed(self, msg: dict[str, Any]) -> None:
-        """Apply the current authenticated user's armed activity.
+    def _apply_pinned_activity_changed(self, msg: dict[str, Any]) -> None:
+        """Apply the current authenticated user's pinned activity.
 
-        Fires `drift_beacon_activity_armed`/`_disarmed` for automations, tagged
+        Fires `drift_beacon_activity_pinned`/`_unpinned` for automations, tagged
         with whether a live session is active right now. This lets lighting
-        automations suppress the armed light while a session is showing —
-        `Activity.startSession` implicitly disarms, so starting a session on
-        an already-armed activity fires both a session-started and a
-        disarmed message; `has_live_session` here is read fresh, after
+        automations suppress the pinned light while a session is showing —
+        `Activity.startSession` implicitly unpins, so starting a session on
+        an already-pinned activity fires both a session-started and a
+        unpinned message; `has_live_session` here is read fresh, after
         `_apply_session_started` would already have updated
-        `_workspace_live_sessions`, so the disarm is correctly seen as a
-        no-op for lighting purposes. Armed state itself is still recorded
+        `_workspace_live_sessions`, so the unpin is correctly seen as a
+        no-op for lighting purposes. Pinned state itself is still recorded
         here regardless of `has_live_session`, so if the session later ends,
-        `_apply_session_ended` finds this activity still armed and hands
+        `_apply_session_ended` finds this activity still pinned and hands
         lighting back to it instead of turning off.
         """
         workspace = self._workspaces[0] if self._workspaces else None
@@ -819,14 +871,16 @@ class DriftBeaconWebSocketManager:
             return
 
         workspace_id = workspace["id"]
-        previous = self._workspace_armed_activities.get(workspace_id)
-        armed_activity_raw = msg.get("armedActivity")
-        new = _parse_armed_activity(armed_activity_raw) if armed_activity_raw else None
-        self._workspace_armed_activities[workspace_id] = new
+        previous = self._workspace_pinned_activities.get(workspace_id)
+        pinned_activity_raw = msg.get("pinnedActivity")
+        new = (
+            _parse_pinned_activity(pinned_activity_raw) if pinned_activity_raw else None
+        )
+        self._workspace_pinned_activities[workspace_id] = new
 
         _LOGGER.debug(
-            "Armed activity changed: %s",
-            armed_activity_raw.get("activityId") if armed_activity_raw else "none",
+            "Pinned activity changed: %s",
+            pinned_activity_raw.get("activityId") if pinned_activity_raw else "none",
         )
 
         previous_activity_id = previous["activity_id"] if previous else None
@@ -842,7 +896,7 @@ class DriftBeaconWebSocketManager:
                 return
             category = self.get_category(activity.get("category_id"))
             self.hass.bus.async_fire(
-                EVENT_ACTIVITY_ARMED,
+                EVENT_ACTIVITY_PINNED,
                 {
                     "activity_id": activity["id"],
                     "activity_name": activity["name"],
@@ -856,14 +910,14 @@ class DriftBeaconWebSocketManager:
                     ),
                     "workspace_id": workspace["id"],
                     "workspace_name": workspace["name"],
-                    "armed_at": new["armed_at"],
+                    "pinned_at": new["pinned_at"],
                     "has_live_session": has_live_session,
                 },
             )
         elif previous is not None:
             previous_activity = self.get_activity(previous["activity_id"])
             self.hass.bus.async_fire(
-                EVENT_ACTIVITY_DISARMED,
+                EVENT_ACTIVITY_UNPINNED,
                 {
                     "activity_id": previous["activity_id"],
                     "activity_name": (
@@ -888,7 +942,7 @@ class DriftBeaconWebSocketManager:
                 {"activityId": activity_id},
             )
             return True
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001
             _LOGGER.error("Failed to start session: %s", err)
             return False
 
@@ -904,7 +958,7 @@ class DriftBeaconWebSocketManager:
             params = {"activityId": activity_id} if activity_id is not None else {}
             await self._send_rpc("StopSession", params)
             return True
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001
             _LOGGER.error("Failed to stop session: %s", err)
             return False
 
@@ -917,27 +971,27 @@ class DriftBeaconWebSocketManager:
                 {"activityId": activity_id},
             )
             return True
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001
             _LOGGER.error("Failed to mark activity: %s", err)
             return False
 
-    async def arm_activity(self, activity_id: str) -> bool:
-        """Arm an activity via RPC."""
-        _LOGGER.debug("Arming activity %s", activity_id)
+    async def pin_activity(self, activity_id: str) -> bool:
+        """Pin an activity via RPC."""
+        _LOGGER.debug("Pinning activity %s", activity_id)
         try:
-            await self._send_rpc("ArmActivity", {"activityId": activity_id})
+            await self._send_rpc("PinActivity", {"activityId": activity_id})
             return True
-        except Exception as err:
-            _LOGGER.error("Failed to arm activity: %s", err)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Failed to pin activity: %s", err)
             return False
 
-    async def disarm_activity(self, activity_id: str | None = None) -> bool:
-        """Disarm an activity, or whichever activity is armed when omitted."""
-        _LOGGER.debug("Disarming activity %s", activity_id or "<any>")
+    async def unpin_activity(self, activity_id: str | None = None) -> bool:
+        """Unpin an activity, or whichever activity is pinned when omitted."""
+        _LOGGER.debug("Unpinning activity %s", activity_id or "<any>")
         try:
             params = {"activityId": activity_id} if activity_id is not None else {}
-            await self._send_rpc("DisarmActivity", params)
+            await self._send_rpc("UnpinActivity", params)
             return True
-        except Exception as err:
-            _LOGGER.error("Failed to disarm activity: %s", err)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Failed to unpin activity: %s", err)
             return False

@@ -2,22 +2,19 @@ blueprint:
   name: Drift Beacon Activity Lighting
   description: >
     Event-driven automation for controlling lights based on Drift Beacon sessions and
-    armed activities. 
-
-    Live session lighting always takes priority. Armed-activity lighting only applies
-    when no session is currently live.
-
-    This blueprint listens to the following events:
-    - `drift_beacon_session_started` - New session begins
-    - `drift_beacon_session_changed` - Switch between activities
-    - `drift_beacon_session_stopped` - Session ends
-    - `drift_beacon_activity_armed` - An activity becomes armed
-    - `drift_beacon_activity_disarmed` - The armed activity is cleared
+    pinned activities.
 
   domain: automation
   source_url: https://github.com/rshallam/drift-beacon/blob/main/ha-integration/blueprints/drift_beacon_activity_lighting_events.yaml
 
   input:
+    workspace:
+      name: Workspace
+      description: Select the Drift Beacon workspace whose activity events should control these lights
+      selector:
+        device:
+          integration: drift_beacon
+
     target_lights:
       name: Target Lights
       description: The lights or light groups to control based on active activity
@@ -37,9 +34,9 @@ blueprint:
           unit_of_measurement: "%"
           mode: slider
 
-    armed_brightness:
-      name: Armed Brightness
-      description: Brightness level for the lights when an activity is armed but no session is live (0-100%)
+    pinned_brightness:
+      name: Pinned Brightness
+      description: Brightness level for the lights when an activity is pinned but no session is live (0-100%)
       default: 5
       selector:
         number:
@@ -83,8 +80,17 @@ mode: restart
 max_exceeded: silent
 
 variables:
+  workspace_device: !input workspace
+  selected_workspace_id: >-
+    {%- set selected = namespace(id='') -%}
+    {%- for domain, identifier in device_attr(workspace_device, 'identifiers') or [] -%}
+      {%- if domain == 'drift_beacon' -%}
+        {%- set selected.id = identifier -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {{ selected.id }}
   session_brightness: !input session_brightness
-  armed_brightness: !input armed_brightness
+  pinned_brightness: !input pinned_brightness
   transition: !input transition
   off_transition: !input off_transition
   disable_conditions: !input disable_when
@@ -103,12 +109,18 @@ trigger:
     id: session_stopped
 
   - platform: event
-    event_type: drift_beacon_activity_armed
-    id: activity_armed
+    event_type: drift_beacon_activity_pinned
+    id: activity_pinned
 
   - platform: event
-    event_type: drift_beacon_activity_disarmed
-    id: activity_disarmed
+    event_type: drift_beacon_activity_unpinned
+    id: activity_unpinned
+
+condition:
+  - condition: template
+    value_template: >-
+      {{ selected_workspace_id != '' and
+         trigger.event.data.workspace_id == selected_workspace_id }}
 
 action:
   - if: "{{ disable_conditions | length > 0 }}"
@@ -134,19 +146,19 @@ action:
                       brightness_pct: !input session_brightness
                       transition: !input transition
 
-              # Session stopped -> armed lighting takes over if something is still
-              # armed, otherwise off
+              # Session stopped -> pinned lighting takes over if something is still
+              # pinned, otherwise off
               - conditions:
                   - condition: trigger
                     id: session_stopped
                 sequence:
-                  - if: "{{ trigger.event.data.armed_activity_id is not none }}"
+                  - if: "{{ trigger.event.data.pinned_activity_id is not none }}"
                     then:
                       - action: light.turn_on
                         target: !input target_lights
                         data:
-                          rgb_color: "{{ trigger.event.data.armed_color }}"
-                          brightness_pct: !input armed_brightness
+                          rgb_color: "{{ trigger.event.data.pinned_color }}"
+                          brightness_pct: !input pinned_brightness
                           transition: !input transition
                     else:
                       - action: light.turn_off
@@ -154,10 +166,10 @@ action:
                         data:
                           transition: !input off_transition
 
-              # Activity armed -> armed lighting, unless a session is already live
+              # Activity pinned -> pinned lighting, unless a session is already live
               - conditions:
                   - condition: trigger
-                    id: activity_armed
+                    id: activity_pinned
                   - condition: template
                     value_template: "{{ not trigger.event.data.has_live_session }}"
                 sequence:
@@ -165,13 +177,13 @@ action:
                     target: !input target_lights
                     data:
                       rgb_color: "{{ trigger.event.data.color }}"
-                      brightness_pct: !input armed_brightness
+                      brightness_pct: !input pinned_brightness
                       transition: !input transition
 
-              # Activity disarmed -> off, unless a session is already live
+              # Activity unpinned -> off, unless a session is already live
               - conditions:
                   - condition: trigger
-                    id: activity_disarmed
+                    id: activity_unpinned
                   - condition: template
                     value_template: "{{ not trigger.event.data.has_live_session }}"
                 sequence:
@@ -198,19 +210,19 @@ action:
                   brightness_pct: !input session_brightness
                   transition: !input transition
 
-          # Session stopped -> armed lighting takes over if something is still
-          # armed, otherwise off
+          # Session stopped -> pinned lighting takes over if something is still
+          # pinned, otherwise off
           - conditions:
               - condition: trigger
                 id: session_stopped
             sequence:
-              - if: "{{ trigger.event.data.armed_activity_id is not none }}"
+              - if: "{{ trigger.event.data.pinned_activity_id is not none }}"
                 then:
                   - action: light.turn_on
                     target: !input target_lights
                     data:
-                      rgb_color: "{{ trigger.event.data.armed_color }}"
-                      brightness_pct: !input armed_brightness
+                      rgb_color: "{{ trigger.event.data.pinned_color }}"
+                      brightness_pct: !input pinned_brightness
                       transition: !input transition
                 else:
                   - action: light.turn_off
@@ -218,10 +230,10 @@ action:
                     data:
                       transition: !input off_transition
 
-          # Activity armed -> armed lighting, unless a session is already live
+          # Activity pinned -> pinned lighting, unless a session is already live
           - conditions:
               - condition: trigger
-                id: activity_armed
+                id: activity_pinned
               - condition: template
                 value_template: "{{ not trigger.event.data.has_live_session }}"
             sequence:
@@ -229,13 +241,13 @@ action:
                 target: !input target_lights
                 data:
                   rgb_color: "{{ trigger.event.data.color }}"
-                  brightness_pct: !input armed_brightness
+                  brightness_pct: !input pinned_brightness
                   transition: !input transition
 
-          # Activity disarmed -> off, unless a session is already live
+          # Activity unpinned -> off, unless a session is already live
           - conditions:
               - condition: trigger
-                id: activity_disarmed
+                id: activity_unpinned
               - condition: template
                 value_template: "{{ not trigger.event.data.has_live_session }}"
             sequence:

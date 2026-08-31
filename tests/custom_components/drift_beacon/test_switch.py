@@ -1,4 +1,4 @@
-"""Tests for Drift Beacon activity switch discovery and armed state."""
+"""Tests for Drift Beacon activity switch discovery and pinned state."""
 
 from __future__ import annotations
 
@@ -36,10 +36,13 @@ class FakeManager:
             activity("point-1", "Water", "point"),
         ]
         self.available = True
-        self.armed_activity = None
+        self.workspace_id = "workspace-1"
+        self.device_info = {"identifiers": {("drift_beacon", self.workspace_id)}}
+        self.user_attributes = {"user_id": "user-1", "user_name": "Rich"}
+        self.pinned_activity = None
         self.listeners = []
-        self.arm_activity = AsyncMock(return_value=True)
-        self.disarm_activity = AsyncMock(return_value=True)
+        self.pin_activity = AsyncMock(return_value=True)
+        self.unpin_activity = AsyncMock(return_value=True)
 
     def async_add_listener(self, listener):
         """Register a state listener."""
@@ -50,9 +53,13 @@ class FakeManager:
         """Return the single test workspace."""
         return {"id": "workspace-1", "name": "Personal"}
 
-    def get_armed_activity(self, _workspace_id: str):
-        """Return current armed state."""
-        return self.armed_activity
+    def get_pinned_activity(self, _workspace_id: str):
+        """Return current pinned state."""
+        return self.pinned_activity
+
+    def get_live_session(self, _workspace_id: str):
+        """Return no live session."""
+        return
 
     def get_activity(self, activity_id: str):
         """Look up an activity."""
@@ -63,7 +70,7 @@ class FakeManager:
 
     def get_category(self, _category_id: str | None):
         """Return no category."""
-        return None
+        return
 
 
 class FakeEntry:
@@ -88,8 +95,8 @@ class FakeHomeAssistant:
 
 
 @pytest.mark.asyncio
-async def test_discovers_session_and_armed_activity_switches() -> None:
-    """Span activities get session switches and all activities get arm switches."""
+async def test_discovers_session_and_pinned_activity_switches() -> None:
+    """Span activities get session switches and all activities get pin switches."""
     manager = FakeManager()
     entry = FakeEntry(manager)
     added_entities = []
@@ -104,15 +111,20 @@ async def test_discovers_session_and_armed_activity_switches() -> None:
     )
 
     assert {entity.unique_id for entity in added_entities} == {
-        "entry-1_span-1",
-        "entry-1_armed_span-1",
-        "entry-1_armed_point-1",
+        "workspace-1:session:span-1",
+        "workspace-1:pin:span-1",
+        "workspace-1:pin:point-1",
     }
+    assert all(entity.device_info == manager.device_info for entity in added_entities)
+    assert all(
+        entity.extra_state_attributes["user_name"] == "Rich"
+        for entity in added_entities
+    )
 
 
 @pytest.mark.asyncio
-async def test_armed_switches_follow_single_slot_and_send_rpcs() -> None:
-    """Displacement updates switch state and only the active switch disarms."""
+async def test_pinned_switches_follow_single_slot_and_send_rpcs() -> None:
+    """Displacement updates switch state and only the active switch unpins."""
     manager = FakeManager()
     entry = FakeEntry(manager)
     added_entities = []
@@ -125,32 +137,32 @@ async def test_armed_switches_follow_single_slot_and_send_rpcs() -> None:
         entry,
         add_entities,
     )
-    armed_switches = {
+    pinned_switches = {
         entity.unique_id: entity
         for entity in added_entities
-        if "_armed_" in entity.unique_id
+        if ":pin:" in entity.unique_id
     }
-    span_switch = armed_switches["entry-1_armed_span-1"]
-    point_switch = armed_switches["entry-1_armed_point-1"]
+    span_switch = pinned_switches["workspace-1:pin:span-1"]
+    point_switch = pinned_switches["workspace-1:pin:point-1"]
 
-    manager.armed_activity = {
+    manager.pinned_activity = {
         "activity_id": "span-1",
-        "armed_at": "2026-08-14T10:00:00.000Z",
+        "pinned_at": "2026-08-14T10:00:00.000Z",
     }
     assert span_switch.is_on
     assert not point_switch.is_on
 
-    manager.armed_activity = {
+    manager.pinned_activity = {
         "activity_id": "point-1",
-        "armed_at": "2026-08-14T10:01:00.000Z",
+        "pinned_at": "2026-08-14T10:01:00.000Z",
     }
     assert not span_switch.is_on
     assert point_switch.is_on
 
     await span_switch.async_turn_on()
-    manager.arm_activity.assert_awaited_once_with("span-1")
+    manager.pin_activity.assert_awaited_once_with("span-1")
 
     await span_switch.async_turn_off()
-    manager.disarm_activity.assert_not_awaited()
+    manager.unpin_activity.assert_not_awaited()
     await point_switch.async_turn_off()
-    manager.disarm_activity.assert_awaited_once_with("point-1")
+    manager.unpin_activity.assert_awaited_once_with("point-1")

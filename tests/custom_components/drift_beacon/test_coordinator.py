@@ -14,10 +14,15 @@ from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from custom_components.drift_beacon.const import (
     CONF_API_TOKEN,
     CONF_HOST,
+    CONF_HUB_ID,
     CONF_PORT,
     CONF_PROTOCOL,
-    EVENT_ACTIVITY_ARMED,
-    EVENT_ACTIVITY_DISARMED,
+    CONF_USER_ID,
+    CONF_USER_NAME,
+    CONF_WORKSPACE_ID,
+    CONF_WORKSPACE_NAME,
+    EVENT_ACTIVITY_PINNED,
+    EVENT_ACTIVITY_UNPINNED,
     EVENT_SESSION_STOPPED,
     WS_RECONNECT_MAX_DELAY,
 )
@@ -26,6 +31,18 @@ from custom_components.drift_beacon.coordinator import (
     _SubscriptionError,
     hex_to_rgb,
 )
+
+
+@pytest.fixture(autouse=True)
+def mock_device_registry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep coordinator tests independent from Home Assistant storage setup."""
+    registry = SimpleNamespace(
+        async_get_device=Mock(return_value=None), async_update_device=Mock()
+    )
+    monkeypatch.setattr(
+        "custom_components.drift_beacon.coordinator.dr.async_get",
+        lambda _hass: registry,
+    )
 
 
 class FakeBus:
@@ -45,6 +62,8 @@ class FakeHomeAssistant:
     def __init__(self) -> None:
         self.loop = asyncio.get_running_loop()
         self.bus = FakeBus()
+        self.data = {}
+        self.config_entries = SimpleNamespace(async_update_entry=Mock())
 
     def async_create_task(self, coro, name: str | None = None):
         """Create a named asyncio task."""
@@ -54,13 +73,26 @@ class FakeHomeAssistant:
 class FakeConfigEntry:
     """Minimal config entry used by the manager."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        workspace_id: str = "workspace-1",
+        workspace_name: str = "Personal",
+        user_id: str = "user-1",
+        user_name: str = "Rich",
+    ) -> None:
         self.data = {
             CONF_API_TOKEN: "token",
             CONF_HOST: "example.test",
             CONF_PORT: 9000,
             CONF_PROTOCOL: "https",
+            CONF_HUB_ID: "hub-1",
+            CONF_WORKSPACE_ID: workspace_id,
+            CONF_WORKSPACE_NAME: workspace_name,
+            CONF_USER_ID: user_id,
+            CONF_USER_NAME: user_name,
         }
+        self.entry_id = f"entry-{workspace_id}"
+        self.title = workspace_name
         self.reauth_calls = 0
 
     def async_start_reauth(self, hass) -> None:
@@ -68,9 +100,14 @@ class FakeConfigEntry:
         self.reauth_calls += 1
 
 
-def create_manager() -> tuple[DriftBeaconWebSocketManager, FakeConfigEntry]:
+def create_manager(
+    workspace_id: str = "workspace-1",
+    workspace_name: str = "Personal",
+    user_id: str = "user-1",
+    user_name: str = "Rich",
+) -> tuple[DriftBeaconWebSocketManager, FakeConfigEntry]:
     """Create a manager with minimal Home Assistant collaborators."""
-    entry = FakeConfigEntry()
+    entry = FakeConfigEntry(workspace_id, workspace_name, user_id, user_name)
     return DriftBeaconWebSocketManager(FakeHomeAssistant(), entry), entry
 
 
@@ -85,7 +122,11 @@ def access_error(status: int) -> aiohttp.ClientResponseError:
 
 
 def snapshot_message(
-    workspace_id: str = "workspace-1", activity_name: str = "Focus"
+    workspace_id: str = "workspace-1",
+    workspace_name: str = "Personal",
+    user_id: str = "user-1",
+    user_name: str = "Rich",
+    activity_name: str = "Focus",
 ) -> dict:
     """Build a subscription snapshot response."""
     return {
@@ -96,7 +137,9 @@ def snapshot_message(
             {
                 "_tag": "Snapshot",
                 "workspaceId": workspace_id,
-                "workspaceName": "Personal",
+                "workspaceName": workspace_name,
+                "userId": user_id,
+                "userName": user_name,
                 "activities": [
                     {
                         "id": "activity-1",
@@ -106,14 +149,14 @@ def snapshot_message(
                 ],
                 "categories": [],
                 "liveSessions": [],
-                "armedActivity": None,
+                "pinnedActivity": None,
             }
         ],
     }
 
 
 def two_activity_snapshot_message() -> dict:
-    """Build a subscription snapshot with two span activities for arming tests."""
+    """Build a subscription snapshot with two span activities for pinning tests."""
     return {
         "jsonrpc": "2.0",
         "id": 1,
@@ -123,6 +166,8 @@ def two_activity_snapshot_message() -> dict:
                 "_tag": "Snapshot",
                 "workspaceId": "workspace-1",
                 "workspaceName": "Personal",
+                "userId": "user-1",
+                "userName": "Rich",
                 "activities": [
                     {
                         "id": "activity-1",
@@ -139,16 +184,16 @@ def two_activity_snapshot_message() -> dict:
                 ],
                 "categories": [],
                 "liveSessions": [],
-                "armedActivity": None,
+                "pinnedActivity": None,
             }
         ],
     }
 
 
-def armed_changed_message(
-    activity_id: str | None, armed_at: str = "2026-08-14T10:00:00.000Z"
+def pinned_changed_message(
+    activity_id: str | None, pinned_at: str = "2026-08-14T10:00:00.000Z"
 ) -> str:
-    """Build a raw ArmedActivityChanged stream message."""
+    """Build a raw PinnedActivityChanged stream message."""
     return json.dumps(
         {
             "jsonrpc": "2.0",
@@ -156,9 +201,9 @@ def armed_changed_message(
             "chunk": True,
             "result": [
                 {
-                    "_tag": "ArmedActivityChanged",
-                    "armedActivity": (
-                        {"activityId": activity_id, "armedAt": armed_at}
+                    "_tag": "PinnedActivityChanged",
+                    "pinnedActivity": (
+                        {"activityId": activity_id, "pinnedAt": pinned_at}
                         if activity_id
                         else None
                     ),
@@ -263,25 +308,92 @@ async def test_snapshot_restores_availability_and_replaces_state() -> None:
     assert manager.workspaces == [{"id": "workspace-1", "name": "Personal"}]
     assert manager.get_activity("activity-1")["name"] == "Recovered"
     assert manager.get_activity("old") is None
-    assert manager.get_armed_activity("workspace-1") is None
+    assert manager.get_pinned_activity("workspace-1") is None
 
 
 @pytest.mark.asyncio
-async def test_armed_activity_snapshot_and_change_update_state() -> None:
-    """Armed activity state should hydrate and follow stream changes."""
+async def test_snapshot_rejects_a_different_workspace() -> None:
+    """A runtime token must never silently move an entry to another workspace."""
+    manager, _ = create_manager()
+    manager._subscription_rpc_id = 1
+
+    with pytest.raises(ConfigEntryAuthFailed, match="different Drift Beacon workspace"):
+        manager._handle_message(
+            json.dumps(snapshot_message(workspace_id="workspace-2"))
+        )
+
+
+@pytest.mark.asyncio
+async def test_snapshot_refreshes_workspace_and_user_names() -> None:
+    """Friendly-name changes update runtime and config-entry metadata."""
+    manager, entry = create_manager()
+    manager._subscription_rpc_id = 1
+    message = snapshot_message()
+    snapshot = message["result"][0]
+    snapshot["workspaceName"] = "Renamed Workspace"
+    snapshot["userName"] = "Richard"
+
+    manager._handle_message(json.dumps(message))
+
+    assert manager.workspace_name == "Renamed Workspace"
+    assert manager.user_id == "user-1"
+    assert manager.user_name == "Richard"
+    manager.hass.config_entries.async_update_entry.assert_called_once_with(
+        entry,
+        data={
+            **entry.data,
+            CONF_WORKSPACE_NAME: "Renamed Workspace",
+            CONF_USER_NAME: "Richard",
+        },
+        title="Renamed Workspace",
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_workspace_managers_keep_identity_and_state_isolated() -> None:
+    """Entries from one hub must never share personal or workspace state."""
+    personal, _ = create_manager()
+    family, _ = create_manager("workspace-2", "Family", "user-2", "Priya")
+    personal._subscription_rpc_id = 1
+    family._subscription_rpc_id = 1
+
+    personal._handle_message(json.dumps(snapshot_message(activity_name="Focus")))
+    family._handle_message(
+        json.dumps(
+            snapshot_message(
+                workspace_id="workspace-2",
+                workspace_name="Family",
+                user_id="user-2",
+                user_name="Priya",
+                activity_name="Chores",
+            )
+        )
+    )
+
+    assert personal.workspace_id == "workspace-1"
+    assert family.workspace_id == "workspace-2"
+    assert personal.user_attributes == {"user_id": "user-1", "user_name": "Rich"}
+    assert family.user_attributes == {"user_id": "user-2", "user_name": "Priya"}
+    assert [activity["name"] for activity in personal.activities] == ["Focus"]
+    assert [activity["name"] for activity in family.activities] == ["Chores"]
+
+
+@pytest.mark.asyncio
+async def test_pinned_activity_snapshot_and_change_update_state() -> None:
+    """Pinned activity state should hydrate and follow stream changes."""
     manager, _ = create_manager()
     manager._subscription_rpc_id = 1
     message = snapshot_message()
-    message["result"][0]["armedActivity"] = {
+    message["result"][0]["pinnedActivity"] = {
         "activityId": "activity-1",
-        "armedAt": "2026-08-14T10:00:00.000Z",
+        "pinnedAt": "2026-08-14T10:00:00.000Z",
     }
 
     manager._handle_message(json.dumps(message))
 
-    assert manager.get_armed_activity("workspace-1") == {
+    assert manager.get_pinned_activity("workspace-1") == {
         "activity_id": "activity-1",
-        "armed_at": "2026-08-14T10:00:00.000Z",
+        "pinned_at": "2026-08-14T10:00:00.000Z",
     }
 
     manager._handle_message(
@@ -292,30 +404,30 @@ async def test_armed_activity_snapshot_and_change_update_state() -> None:
                 "chunk": True,
                 "result": [
                     {
-                        "_tag": "ArmedActivityChanged",
-                        "armedActivity": None,
+                        "_tag": "PinnedActivityChanged",
+                        "pinnedActivity": None,
                     }
                 ],
             }
         )
     )
 
-    assert manager.get_armed_activity("workspace-1") is None
+    assert manager.get_pinned_activity("workspace-1") is None
 
 
 @pytest.mark.asyncio
-async def test_activity_armed_and_disarmed_events_track_live_session_state() -> None:
-    """Armed/disarmed events fire only on real transitions and carry has_live_session."""
+async def test_activity_pinned_and_unpinned_events_track_live_session_state() -> None:
+    """Pinned/unpinned events fire only on real transitions and carry has_live_session."""
     manager, _ = create_manager()
     manager._subscription_rpc_id = 1
     manager._handle_message(json.dumps(two_activity_snapshot_message()))
 
-    # Arm with no live session -> event fires with has_live_session False and the
+    # Pin with no live session -> event fires with has_live_session False and the
     # full activity/category/workspace payload.
-    manager._handle_message(armed_changed_message("activity-1"))
+    manager._handle_message(pinned_changed_message("activity-1"))
     assert manager.hass.bus.fired == [
         (
-            EVENT_ACTIVITY_ARMED,
+            EVENT_ACTIVITY_PINNED,
             {
                 "activity_id": "activity-1",
                 "activity_name": "Focus",
@@ -327,15 +439,15 @@ async def test_activity_armed_and_disarmed_events_track_live_session_state() -> 
                 "category_color": None,
                 "workspace_id": "workspace-1",
                 "workspace_name": "Personal",
-                "armed_at": "2026-08-14T10:00:00.000Z",
+                "pinned_at": "2026-08-14T10:00:00.000Z",
                 "has_live_session": False,
             },
         )
     ]
     manager.hass.bus.fired.clear()
 
-    # Re-arming the same activity is not a transition -> nothing fires.
-    manager._handle_message(armed_changed_message("activity-1"))
+    # Re-pinning the same activity is not a transition -> nothing fires.
+    manager._handle_message(pinned_changed_message("activity-1"))
     assert manager.hass.bus.fired == []
 
     # A live session starts on a different activity. Poked directly (as other
@@ -347,25 +459,25 @@ async def test_activity_armed_and_disarmed_events_track_live_session_state() -> 
         "start_time": "2026-08-14T10:05:00.000Z",
     }
 
-    # Displacing the armed activity while a session is live still updates state...
+    # Displacing the pinned activity while a session is live still updates state...
     manager._handle_message(
-        armed_changed_message("activity-2", armed_at="2026-08-14T10:06:00.000Z")
+        pinned_changed_message("activity-2", pinned_at="2026-08-14T10:06:00.000Z")
     )
-    assert manager.get_armed_activity("workspace-1") == {
+    assert manager.get_pinned_activity("workspace-1") == {
         "activity_id": "activity-2",
-        "armed_at": "2026-08-14T10:06:00.000Z",
+        "pinned_at": "2026-08-14T10:06:00.000Z",
     }
     # ...but the fired event reports a live session, so lighting automations no-op.
     assert len(manager.hass.bus.fired) == 1
-    assert manager.hass.bus.fired[0][0] == EVENT_ACTIVITY_ARMED
+    assert manager.hass.bus.fired[0][0] == EVENT_ACTIVITY_PINNED
     assert manager.hass.bus.fired[0][1]["has_live_session"] is True
     manager.hass.bus.fired.clear()
 
-    # Disarming while the session is still live also reports has_live_session True.
-    manager._handle_message(armed_changed_message(None))
+    # Unpinning while the session is still live also reports has_live_session True.
+    manager._handle_message(pinned_changed_message(None))
     assert manager.hass.bus.fired == [
         (
-            EVENT_ACTIVITY_DISARMED,
+            EVENT_ACTIVITY_UNPINNED,
             {
                 "activity_id": "activity-2",
                 "activity_name": "Read",
@@ -378,13 +490,15 @@ async def test_activity_armed_and_disarmed_events_track_live_session_state() -> 
 
 
 @pytest.mark.asyncio
-async def test_session_stopped_falls_back_to_activity_armed_during_the_session() -> None:
-    """Ending a session hands lighting to whatever got armed while it was live."""
+async def test_session_stopped_falls_back_to_activity_pinned_during_the_session() -> (
+    None
+):
+    """Ending a session hands lighting to whatever got pinned while it was live."""
     manager, _ = create_manager()
     manager._subscription_rpc_id = 1
     manager._handle_message(json.dumps(two_activity_snapshot_message()))
 
-    # Session live on activity-2, nothing armed -> stopping falls back to off.
+    # Session live on activity-2, nothing pinned -> stopping falls back to off.
     manager._workspace_live_sessions["workspace-1"] = {
         "id": "session-1",
         "activity_id": "activity-2",
@@ -398,25 +512,25 @@ async def test_session_stopped_falls_back_to_activity_armed_during_the_session()
             "activity_name": "Read",
             "workspace_id": "workspace-1",
             "workspace_name": "Personal",
-            "armed_activity_id": None,
-            "armed_activity_name": None,
-            "armed_color": None,
+            "pinned_activity_id": None,
+            "pinned_activity_name": None,
+            "pinned_color": None,
         },
     )
     manager.hass.bus.fired.clear()
 
-    # A session goes live, a *different* activity gets armed while it's live, then
-    # the session ends -> the armed activity's lighting should take over instead of
-    # turning off, regardless of when the arming happened relative to the session.
+    # A session goes live, a *different* activity gets pinned while it's live, then
+    # the session ends -> the pinned activity's lighting should take over instead of
+    # turning off, regardless of when the pinning happened relative to the session.
     manager._workspace_live_sessions["workspace-1"] = {
         "id": "session-2",
         "activity_id": "activity-2",
         "start_time": "2026-08-14T10:10:00.000Z",
     }
     manager._handle_message(
-        armed_changed_message("activity-1", armed_at="2026-08-14T10:11:00.000Z")
+        pinned_changed_message("activity-1", pinned_at="2026-08-14T10:11:00.000Z")
     )
-    manager.hass.bus.fired.clear()  # discard the has_live_session=True armed event
+    manager.hass.bus.fired.clear()  # discard the has_live_session=True pinned event
 
     manager._handle_message(session_ended_message("session-2", "activity-2"))
     assert manager.hass.bus.fired == [
@@ -427,29 +541,30 @@ async def test_session_stopped_falls_back_to_activity_armed_during_the_session()
                 "activity_name": "Read",
                 "workspace_id": "workspace-1",
                 "workspace_name": "Personal",
-                "armed_activity_id": "activity-1",
-                "armed_activity_name": "Focus",
-                "armed_color": hex_to_rgb("#4A90D9"),
+                "pinned_activity_id": "activity-1",
+                "pinned_activity_name": "Focus",
+                "pinned_color": hex_to_rgb("#4A90D9"),
             },
         )
     ]
 
 
 @pytest.mark.asyncio
-async def test_arm_and_disarm_rpc_payloads() -> None:
-    """Armed activity actions should use the integration RPC contract."""
+async def test_pin_and_unpin_rpc_payloads() -> None:
+    """Pinned activity actions should use the integration RPC contract."""
     manager, _ = create_manager()
     manager._send_rpc = AsyncMock(return_value={})
 
-    assert await manager.arm_activity("activity-1")
-    assert await manager.disarm_activity("activity-1")
-    assert await manager.disarm_activity()
+    assert await manager.pin_activity("activity-1")
+    assert await manager.unpin_activity("activity-1")
+    assert await manager.unpin_activity()
 
     assert manager._send_rpc.await_args_list == [
-        call("ArmActivity", {"activityId": "activity-1"}),
-        call("DisarmActivity", {"activityId": "activity-1"}),
-        call("DisarmActivity", {}),
+        call("PinActivity", {"activityId": "activity-1"}),
+        call("UnpinActivity", {"activityId": "activity-1"}),
+        call("UnpinActivity", {}),
     ]
+
 
 @pytest.mark.asyncio
 async def test_subscription_error_forces_connection_retry() -> None:

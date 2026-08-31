@@ -1,0 +1,7 @@
+{
+  "services": {
+    "pin_next_item": {
+      "service": "mdi:pin"
+    }
+  }
+}

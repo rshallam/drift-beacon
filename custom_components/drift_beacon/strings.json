@@ -28,10 +28,11 @@
       "invalid_auth": "Invalid access token or workspace access denied. Please check your token and try again.",
       "invalid_server": "Server does not appear to be a Drift Beacon server. Please verify the address.",
       "server_error": "The server returned an error. Please check the server logs.",
+      "wrong_workspace": "This token belongs to a different workspace. Add that workspace as a new integration entry instead.",
       "unknown": "An unexpected error occurred. Please check the logs."
     },
     "abort": {
-      "already_configured": "This server is already configured.",
+      "already_configured": "This workspace is already connected as {user_name}.",
       "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
     }
   }

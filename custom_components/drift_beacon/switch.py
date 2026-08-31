@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 import logging
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import HomeAssistant, callback
@@ -12,7 +13,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     ATTR_ACTIVITY_ID,
-    ATTR_ARMED_AT,
     ATTR_CATEGORY_COLOR,
     ATTR_CATEGORY_ICON,
     ATTR_CATEGORY_ID,
@@ -20,15 +20,15 @@ from .const import (
     ATTR_COLOR,
     ATTR_DESCRIPTION,
     ATTR_ICON,
+    ATTR_PINNED_AT,
+    ATTR_PROGRESS,
     ATTR_SESSION_DURATION,
     ATTR_SESSION_START_TIME,
     ATTR_SORT_ORDER,
     ATTR_TARGET,
     ATTR_UNIT,
-    ATTR_PROGRESS,
     ATTR_WORKSPACE_ID,
     ATTR_WORKSPACE_NAME,
-    DOMAIN,
 )
 from .coordinator import (
     Activity,
@@ -47,14 +47,15 @@ async def async_setup_entry(
 ) -> None:
     manager = entry.runtime_data
     session_entities: dict[str, DriftBeaconActivitySwitch] = {}
-    armed_entities: dict[str, DriftBeaconArmedActivitySwitch] = {}
+    pinned_entities: dict[str, DriftBeaconPinnedActivitySwitch] = {}
 
     @callback
     def _async_add_remove_entities() -> None:
         """Add new entities and remove deleted ones."""
         # Only create switches for span activities (not archived)
         span_activities = [
-            a for a in manager.activities
+            a
+            for a in manager.activities
             if a.get("tracking_type") == "span" and not a.get("archived", False)
         ]
 
@@ -67,9 +68,7 @@ async def async_setup_entry(
         new_entities = []
         for activity in span_activities:
             if activity["id"] in new_ids:
-                entity = DriftBeaconActivitySwitch(
-                    manager, activity, entry.entry_id
-                )
+                entity = DriftBeaconActivitySwitch(manager, activity)
                 session_entities[activity["id"]] = entity
                 new_entities.append(entity)
 
@@ -81,28 +80,26 @@ async def async_setup_entry(
             entity = session_entities.pop(activity_id)
             hass.async_create_task(entity.async_remove())
 
-        armable_activities = [
+        pinnable_activities = [
             activity
             for activity in manager.activities
             if not activity.get("archived", False)
         ]
 
-        current_armable_ids = {activity["id"] for activity in armable_activities}
-        existing_armed_ids = set(armed_entities)
-        new_armed_entities = []
-        for activity in armable_activities:
-            if activity["id"] not in existing_armed_ids:
-                entity = DriftBeaconArmedActivitySwitch(
-                    manager, activity, entry.entry_id
-                )
-                armed_entities[activity["id"]] = entity
-                new_armed_entities.append(entity)
+        current_pinnable_ids = {activity["id"] for activity in pinnable_activities}
+        existing_pinned_ids = set(pinned_entities)
+        new_pinned_entities = []
+        for activity in pinnable_activities:
+            if activity["id"] not in existing_pinned_ids:
+                entity = DriftBeaconPinnedActivitySwitch(manager, activity)
+                pinned_entities[activity["id"]] = entity
+                new_pinned_entities.append(entity)
 
-        if new_armed_entities:
-            async_add_entities(new_armed_entities)
+        if new_pinned_entities:
+            async_add_entities(new_pinned_entities)
 
-        for activity_id in existing_armed_ids - current_armable_ids:
-            entity = armed_entities.pop(activity_id)
+        for activity_id in existing_pinned_ids - current_pinnable_ids:
+            entity = pinned_entities.pop(activity_id)
             hass.async_create_task(entity.async_remove())
 
     # Add initial entities
@@ -122,24 +119,20 @@ class DriftBeaconActivitySwitch(SwitchEntity):
         self,
         manager: DriftBeaconWebSocketManager,
         activity: Activity,
-        config_entry_id: str,
     ) -> None:
         """Initialize the switch."""
         self._manager = manager
         self._activity_id = activity["id"]
-        self._config_entry_id = config_entry_id
         self._remove_listener: Callable | None = None
 
         # Set unique ID for entity registry
-        self._attr_unique_id = f"{config_entry_id}_{activity['id']}"
+        self._attr_unique_id = f"{manager.workspace_id}:session:{activity['id']}"
 
         # Set entity name
         self._attr_name = f"{activity['name']} Session"
 
         # Link to device
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, config_entry_id)},
-        }
+        self._attr_device_info = manager.device_info
 
     async def async_added_to_hass(self) -> None:
         """Register listener when added to hass."""
@@ -197,6 +190,7 @@ class DriftBeaconActivitySwitch(SwitchEntity):
             ATTR_TARGET: activity["progress"]["target"],
             ATTR_WORKSPACE_ID: workspace["id"] if workspace else None,
             ATTR_WORKSPACE_NAME: workspace["name"] if workspace else None,
+            **self._manager.user_attributes,
         }
 
         # Add session information if this activity is active
@@ -225,7 +219,10 @@ class DriftBeaconActivitySwitch(SwitchEntity):
 
         workspace = self._manager.get_workspace_for_activity(self._activity_id)
         if workspace is None:
-            _LOGGER.error("Cannot start session - workspace not found for activity %s", self._activity_id)
+            _LOGGER.error(
+                "Cannot start session - workspace not found for activity %s",
+                self._activity_id,
+            )
             return
 
         success = await self._manager.start_session(self._activity_id)
@@ -239,7 +236,10 @@ class DriftBeaconActivitySwitch(SwitchEntity):
 
         workspace = self._manager.get_workspace_for_activity(self._activity_id)
         if workspace is None:
-            _LOGGER.error("Cannot stop session - workspace not found for activity %s", self._activity_id)
+            _LOGGER.error(
+                "Cannot stop session - workspace not found for activity %s",
+                self._activity_id,
+            )
             return
 
         session = self._manager.get_live_session(workspace["id"])
@@ -260,8 +260,8 @@ class DriftBeaconActivitySwitch(SwitchEntity):
         return self._manager.get_activity(self._activity_id)
 
 
-class DriftBeaconArmedActivitySwitch(SwitchEntity):
-    """Switch that arms or disarms one activity."""
+class DriftBeaconPinnedActivitySwitch(SwitchEntity):
+    """Switch that pins or unpins one activity."""
 
     _attr_has_entity_name = True
     _attr_entity_registry_visible_default = False
@@ -270,17 +270,14 @@ class DriftBeaconArmedActivitySwitch(SwitchEntity):
         self,
         manager: DriftBeaconWebSocketManager,
         activity: Activity,
-        config_entry_id: str,
     ) -> None:
-        """Initialize the armed activity switch."""
+        """Initialize the pinned activity switch."""
         self._manager = manager
         self._activity_id = activity["id"]
         self._remove_listener: Callable | None = None
-        self._attr_unique_id = f"{config_entry_id}_armed_{activity['id']}"
-        self._attr_name = f"{activity['name']} Arm"
-        self._attr_device_info = {
-            "identifiers": {(DOMAIN, config_entry_id)},
-        }
+        self._attr_unique_id = f"{manager.workspace_id}:pin:{activity['id']}"
+        self._attr_name = f"{activity['name']} Pin"
+        self._attr_device_info = manager.device_info
 
     async def async_added_to_hass(self) -> None:
         """Register listener when added to Home Assistant."""
@@ -295,24 +292,24 @@ class DriftBeaconArmedActivitySwitch(SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        """Return whether this is the activity in the user's armed slot."""
+        """Return whether this is the activity in the user's pinned slot."""
         workspace = self._manager.get_workspace_for_activity(self._activity_id)
         if workspace is None:
             return False
-        armed_activity = self._manager.get_armed_activity(workspace["id"])
+        pinned_activity = self._manager.get_pinned_activity(workspace["id"])
         return (
-            armed_activity is not None
-            and armed_activity["activity_id"] == self._activity_id
+            pinned_activity is not None
+            and pinned_activity["activity_id"] == self._activity_id
         )
 
     @property
     def available(self) -> bool:
-        """Return whether armed activity controls are available."""
+        """Return whether pinned activity controls are available."""
         return self._manager.available and self._get_activity() is not None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return activity metadata and the armed timestamp."""
+        """Return activity metadata and the pinned timestamp."""
         activity = self._get_activity()
         if activity is None:
             return {}
@@ -325,9 +322,7 @@ class DriftBeaconArmedActivitySwitch(SwitchEntity):
             ATTR_CATEGORY_ID: activity.get("category_id"),
             ATTR_CATEGORY_NAME: category["name"] if category else None,
             ATTR_CATEGORY_ICON: category["icon"] if category else None,
-            ATTR_CATEGORY_COLOR: (
-                hex_to_rgb(category["color"]) if category else None
-            ),
+            ATTR_CATEGORY_COLOR: (hex_to_rgb(category["color"]) if category else None),
             ATTR_COLOR: hex_to_rgb(activity["color"]),
             ATTR_ICON: activity["icon"],
             ATTR_SORT_ORDER: activity["sort_order"],
@@ -336,31 +331,32 @@ class DriftBeaconArmedActivitySwitch(SwitchEntity):
             ATTR_TARGET: activity["progress"]["target"],
             ATTR_WORKSPACE_ID: workspace["id"] if workspace else None,
             ATTR_WORKSPACE_NAME: workspace["name"] if workspace else None,
+            **self._manager.user_attributes,
         }
 
         if workspace:
-            armed_activity = self._manager.get_armed_activity(workspace["id"])
+            pinned_activity = self._manager.get_pinned_activity(workspace["id"])
             if (
-                armed_activity is not None
-                and armed_activity["activity_id"] == self._activity_id
+                pinned_activity is not None
+                and pinned_activity["activity_id"] == self._activity_id
             ):
-                attributes[ATTR_ARMED_AT] = armed_activity["armed_at"]
+                attributes[ATTR_PINNED_AT] = pinned_activity["pinned_at"]
 
         return attributes
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Arm this activity."""
-        success = await self._manager.arm_activity(self._activity_id)
+        """Pin this activity."""
+        success = await self._manager.pin_activity(self._activity_id)
         if not success:
-            _LOGGER.error("Failed to arm activity %s", self._activity_id)
+            _LOGGER.error("Failed to pin activity %s", self._activity_id)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Disarm this activity if it currently owns the armed slot."""
+        """Unpin this activity if it currently owns the pinned slot."""
         if not self.is_on:
             return
-        success = await self._manager.disarm_activity(self._activity_id)
+        success = await self._manager.unpin_activity(self._activity_id)
         if not success:
-            _LOGGER.error("Failed to disarm activity %s", self._activity_id)
+            _LOGGER.error("Failed to unpin activity %s", self._activity_id)
 
     def _get_activity(self) -> Activity | None:
         """Get the activity data for this entity."""

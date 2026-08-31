@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Any
 
@@ -19,6 +20,10 @@ from .const import (
     CONF_HUB_ID,
     CONF_HUB_NAME,
     CONF_PROTOCOL,
+    CONF_USER_ID,
+    CONF_USER_NAME,
+    CONF_WORKSPACE_ID,
+    CONF_WORKSPACE_NAME,
     DEFAULT_HOST,
     DEFAULT_PORT,
     DETECTION_CANDIDATES,
@@ -33,7 +38,7 @@ _LOGGER = logging.getLogger(__name__)
 class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Drift Beacon."""
 
-    VERSION = 2
+    VERSION = 3
 
     def __init__(self) -> None:
         """Initialize the config flow."""
@@ -65,15 +70,35 @@ class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
                     hub_id = hub_data["device"]["id"]
                     hub_name = hub_data["device"]["name"]
 
-                    # Validate token via WebSocket handshake
-                    await self._validate_token(protocol, host, port, api_token)
+                    connection_info = await self._get_connection_info(
+                        protocol, host, port, api_token
+                    )
+                    workspace_id = connection_info["workspaceId"]
+                    workspace_name = connection_info["workspaceName"]
+                    user_id = connection_info["userId"]
+                    user_name = connection_info["userName"]
 
-                    # Set unique ID to prevent duplicate entries
-                    await self.async_set_unique_id(hub_id)
-                    self._abort_if_unique_id_configured()
+                    await self.async_set_unique_id(workspace_id)
+                    existing = next(
+                        (
+                            entry
+                            for entry in self._async_current_entries()
+                            if entry.unique_id == self.unique_id
+                        ),
+                        None,
+                    )
+                    if existing is not None:
+                        return self.async_abort(
+                            reason="already_configured",
+                            description_placeholders={
+                                "user_name": existing.data.get(
+                                    CONF_USER_NAME, "another user"
+                                )
+                            },
+                        )
 
                     return self.async_create_entry(
-                        title=f"Drift Beacon @ {hub_name}",
+                        title=workspace_name,
                         data={
                             CONF_HOST: host,
                             CONF_PORT: port,
@@ -81,6 +106,10 @@ class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
                             CONF_API_TOKEN: api_token,
                             CONF_HUB_ID: hub_id,
                             CONF_HUB_NAME: hub_name,
+                            CONF_WORKSPACE_ID: workspace_id,
+                            CONF_WORKSPACE_NAME: workspace_name,
+                            CONF_USER_ID: user_id,
+                            CONF_USER_NAME: user_name,
                         },
                     )
 
@@ -147,12 +176,31 @@ class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
             api_token = user_input[CONF_API_TOKEN]
 
             try:
-                await self._validate_token(protocol, host, port, api_token)
+                connection_info = await self._get_connection_info(
+                    protocol, host, port, api_token
+                )
+                if connection_info["workspaceId"] != self._reauth_entry_data.get(
+                    CONF_WORKSPACE_ID
+                ):
+                    errors["base"] = "wrong_workspace"
+                    return self.async_show_form(
+                        step_id="reauth_confirm",
+                        data_schema=vol.Schema({vol.Required(CONF_API_TOKEN): str}),
+                        errors=errors,
+                    )
+
+                entry = self._get_reauth_entry()
+                self.hass.config_entries.async_update_entry(
+                    entry, title=connection_info["workspaceName"]
+                )
 
                 return self.async_update_reload_and_abort(
-                    self._get_reauth_entry(),
+                    entry,
                     data_updates={
                         CONF_API_TOKEN: api_token,
+                        CONF_WORKSPACE_NAME: connection_info["workspaceName"],
+                        CONF_USER_ID: connection_info["userId"],
+                        CONF_USER_NAME: connection_info["userName"],
                     },
                 )
 
@@ -177,10 +225,10 @@ class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
     # Token Validation
     # ============================================================================
 
-    async def _validate_token(
+    async def _get_connection_info(
         self, protocol: str, host: str, port: int, api_token: str
-    ) -> None:
-        """Validate an API token by attempting a WebSocket handshake.
+    ) -> dict[str, str]:
+        """Validate an API token and return its workspace/user identity.
 
         Raises WSServerHandshakeError (401) if the token is invalid.
         Raises ClientConnectionError if the server is unreachable.
@@ -196,7 +244,48 @@ class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
             ssl=False,
             timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
         )
-        await ws.close()
+        try:
+            await ws.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "GetConnectionInfo",
+                    "params": {},
+                    "id": 1,
+                }
+            )
+            while True:
+                message = await asyncio.wait_for(ws.receive(), timeout=API_TIMEOUT)
+                if message.type == aiohttp.WSMsgType.TEXT:
+                    response = json.loads(message.data)
+                    if response.get("id") != 1:
+                        continue
+                    if "error" in response:
+                        raise ValueError(
+                            response["error"].get("message", "GetConnectionInfo failed")
+                        )
+                    result = response.get("result")
+                    required = (
+                        "workspaceId",
+                        "workspaceName",
+                        "userId",
+                        "userName",
+                    )
+                    if not isinstance(result, dict) or not all(
+                        key in result for key in required
+                    ):
+                        raise ValueError("Invalid GetConnectionInfo response")
+                    return {key: str(result[key]) for key in required}
+                if message.type in (
+                    aiohttp.WSMsgType.ERROR,
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                ):
+                    raise aiohttp.ClientConnectionError(
+                        "WebSocket closed before GetConnectionInfo completed"
+                    )
+        finally:
+            await ws.close()
 
     # ============================================================================
     # Protocol Detection
@@ -268,7 +357,7 @@ class DriftBeaconConfigFlow(ConfigFlow, domain=DOMAIN):
                             "Protocol detection: %s succeeded (fallback)", protocol
                         )
                         return (protocol, result)
-                except Exception:  # noqa: BLE001
+                except Exception:  # noqa: BLE001, S110
                     pass
 
         _LOGGER.debug("Protocol detection failed for %s:%s", host, port)
