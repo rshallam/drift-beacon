@@ -41,6 +41,10 @@ PROTOCOL_DETECTION_TIMEOUT: Final = 1.5  # seconds
 # Platforms
 PLATFORMS: Final = ["switch", "sensor", "button"]
 
+# Services
+SERVICE_STOP_SESSION: Final = "stop_session"
+ATTR_PAUSE: Final = "pause"
+
 # Events
 EVENT_SESSION_STARTED: Final = "drift_beacon_session_started"
 EVENT_SESSION_STOPPED: Final = "drift_beacon_session_stopped"

@@ -95,6 +95,7 @@ class DriftBeaconConnectedUserSensor(SensorEntity):
     _attr_has_entity_name = True
     _attr_icon = "mdi:account-circle-outline"
     _attr_name = "Connected user"
+    _attr_entity_registry_visible_default = False
 
     def __init__(self, manager: DriftBeaconWebSocketManager) -> None:
         self._manager = manager
@@ -278,6 +279,7 @@ class DriftBeaconPinnedActivitySensor(SensorEntity):
     """Sensor representing the authenticated user's pinned activity."""
 
     _attr_has_entity_name = True
+    _attr_entity_registry_visible_default = False
 
     def __init__(
         self,

@@ -567,6 +567,23 @@ async def test_pin_and_unpin_rpc_payloads() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_and_pause_session_rpc_payloads() -> None:
+    """Stop and pause should target one activity or whatever is live."""
+    manager, _ = create_manager()
+    manager._send_rpc = AsyncMock(return_value=None)
+
+    assert await manager.stop_session()
+    assert await manager.pause_session("activity-1")
+    assert await manager.pause_session()
+
+    assert manager._send_rpc.await_args_list == [
+        call("StopSession", {}),
+        call("PauseSession", {"activityId": "activity-1"}),
+        call("PauseSession", {}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_subscription_error_forces_connection_retry() -> None:
     """A rejected Subscribe RPC should fail the connection attempt."""
     manager, _ = create_manager()

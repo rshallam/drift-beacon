@@ -962,6 +962,21 @@ class DriftBeaconWebSocketManager:
             _LOGGER.error("Failed to stop session: %s", err)
             return False
 
+    async def pause_session(self, activity_id: str | None = None) -> bool:
+        """End a live session and re-pin its activity via RPC.
+
+        Mirrors ``stop_session``: when ``activity_id`` is omitted, pause whatever
+        session is live for this user (idempotent when nothing is running).
+        """
+        _LOGGER.debug("Pausing session for activity %s", activity_id or "<any>")
+        try:
+            params = {"activityId": activity_id} if activity_id is not None else {}
+            await self._send_rpc("PauseSession", params)
+            return True
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Failed to pause session: %s", err)
+            return False
+
     async def mark_activity(self, activity_id: str) -> bool:
         """Mark a point activity via RPC."""
         _LOGGER.debug("Marking activity %s", activity_id)

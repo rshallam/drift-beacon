@@ -1,0 +1,9 @@
+stop_session:
+  target:
+    device:
+      integration: drift_beacon
+  fields:
+    pause:
+      default: false
+      selector:
+        boolean:

@@ -1,7 +1,7 @@
 {
   "services": {
-    "pin_next_item": {
-      "service": "mdi:pin"
+    "stop_session": {
+      "service": "mdi:stop-circle-outline"
     }
   }
 }

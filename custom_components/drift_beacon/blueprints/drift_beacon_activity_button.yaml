@@ -1,0 +1,127 @@
+blueprint:
+  name: Drift Beacon Activity Button
+  description: >
+    Turn a physical button or remote into a Drift Beacon activity control.
+
+    **Press** tracks the activity: a span activity starts (switching from whatever is
+    live) or stops if it is already live; a point activity is marked.
+
+    **Double press** (optional) pins or unpins the activity.
+
+    **Hold** (optional) stops or pauses whatever session is live in the workspace.
+
+  domain: automation
+  source_url: https://github.com/rshallam/drift-beacon/blob/main/ha-integration/blueprints/drift_beacon_activity_button.yaml
+
+  input:
+    activity:
+      name: Activity
+      description: >
+        The activity this button controls. Pick the activity's **Session** switch for
+        a timed activity, or its button for a point activity — not its Pin switch.
+      selector:
+        entity:
+          filter:
+            - integration: drift_beacon
+              domain:
+                - switch
+                - button
+
+    press_trigger:
+      name: Press
+      description: The button action that tracks the activity (e.g. a single press).
+      selector:
+        trigger:
+
+    double_press_trigger:
+      name: Double press (optional)
+      description: >
+        The button action that pins or unpins the activity. Some remotes also send a
+        single press before a double press — if yours does, pick a different action
+        (such as a long press) so both don't fire.
+      default: []
+      selector:
+        trigger:
+
+    hold_trigger:
+      name: Hold (optional)
+      description: The button action that ends whatever session is live in the workspace.
+      default: []
+      selector:
+        trigger:
+
+    hold_action:
+      name: Hold action
+      description: >
+        Stop ends the live session. Pause ends it and pins the activity so it is ready
+        to resume (whatever was pinned moves to the front of the queue).
+      default: stop
+      selector:
+        select:
+          mode: dropdown
+          options:
+            - label: Stop
+              value: stop
+            - label: Pause
+              value: pause
+
+mode: queued
+max: 5
+max_exceeded: silent
+
+triggers:
+  - triggers: !input press_trigger
+  - triggers: !input double_press_trigger
+  - triggers: !input hold_trigger
+
+variables:
+  activity_entity: !input activity
+  hold_action: !input hold_action
+  press_triggers: !input press_trigger
+  double_press_triggers: !input double_press_trigger
+  # Nested trigger lists are flattened in order and can't carry an id, so the
+  # gesture is recovered from the trigger's position in the flattened list.
+  gesture: >-
+    {%- set i = trigger.idx | int -%}
+    {%- set presses = press_triggers | length -%}
+    {%- set doubles = double_press_triggers | length -%}
+    {{ 'press' if i < presses else 'double_press' if i < presses + doubles else 'hold' }}
+  workspace_device: "{{ device_id(activity_entity) }}"
+  # The activity's Pin switch is the other switch on the workspace device with the
+  # same activity_id, so renamed entity IDs don't break the lookup.
+  pin_entity: >-
+    {%- set activity_id = state_attr(activity_entity, 'activity_id') -%}
+    {{ device_entities(workspace_device)
+       | select('match', 'switch[.]')
+       | reject('eq', activity_entity)
+       | select('is_state_attr', 'activity_id', activity_id)
+       | first
+       | default('', true) }}
+
+actions:
+  - choose:
+      - conditions: "{{ gesture == 'press' and activity_entity.startswith('switch.') }}"
+        sequence:
+          - action: switch.toggle
+            target:
+              entity_id: "{{ activity_entity }}"
+
+      - conditions: "{{ gesture == 'press' }}"
+        sequence:
+          - action: button.press
+            target:
+              entity_id: "{{ activity_entity }}"
+
+      - conditions: "{{ gesture == 'double_press' and pin_entity != '' }}"
+        sequence:
+          - action: switch.toggle
+            target:
+              entity_id: "{{ pin_entity }}"
+
+      - conditions: "{{ gesture == 'hold' }}"
+        sequence:
+          - action: drift_beacon.stop_session
+            target:
+              device_id: "{{ workspace_device }}"
+            data:
+              pause: "{{ hold_action == 'pause' }}"

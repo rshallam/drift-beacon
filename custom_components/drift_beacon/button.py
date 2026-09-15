@@ -176,6 +176,7 @@ class DriftBeaconStopSessionButton(ButtonEntity):
 
     _attr_has_entity_name = True
     _attr_icon = "mdi:stop-circle-outline"
+    _attr_entity_registry_visible_default = False
 
     def __init__(
         self,

@@ -35,5 +35,17 @@
       "already_configured": "This workspace is already connected as {user_name}.",
       "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]"
     }
+  },
+  "services": {
+    "stop_session": {
+      "name": "Stop session",
+      "description": "Stops whatever session is live in the targeted Drift Beacon workspace. Does nothing if no session is running.",
+      "fields": {
+        "pause": {
+          "name": "Pause",
+          "description": "Pin the activity again after stopping, so it is ready to resume. Whatever was pinned moves to the front of the queue."
+        }
+      }
+    }
   }
 }
