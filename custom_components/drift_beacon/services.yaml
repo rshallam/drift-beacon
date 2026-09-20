@@ -7,3 +7,43 @@ stop_session:
       default: false
       selector:
         boolean:
+
+track_activity:
+  target:
+    entity:
+      integration: drift_beacon
+      domain:
+        - switch
+        - button
+
+pause_activity:
+  target:
+    entity:
+      integration: drift_beacon
+      domain:
+        - switch
+        - button
+
+pin_activity:
+  target:
+    entity:
+      integration: drift_beacon
+      domain:
+        - switch
+        - button
+
+unpin_activity:
+  target:
+    entity:
+      integration: drift_beacon
+      domain:
+        - switch
+        - button
+
+queue_activity:
+  target:
+    entity:
+      integration: drift_beacon
+      domain:
+        - switch
+        - button

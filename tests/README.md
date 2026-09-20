@@ -2,7 +2,8 @@
 
 The tests in this directory are focused unit tests for the custom integration in
 `custom_components/drift_beacon`. They import Home Assistant's public classes and constants, but
-they do not start a Home Assistant instance or require a running Drift Beacon server.
+they do not require a running Drift Beacon server. Blueprint tests create a local
+Home Assistant instance to validate and execute automation sequences with recorded service calls.
 
 ## Current setup
 
@@ -55,6 +56,8 @@ Remove `-q` for more runner output, or add `-vv` to show every collected case.
 | `test_coordinator.py` | Connection lifecycle, retry behavior, identity snapshots, events, pin state, and RPC payloads |
 | `test_sensor.py` | Workspace sensor discovery and pinned-activity sensor state |
 | `test_switch.py` | Session/pin switch discovery, single pinned slot behavior, and RPC calls |
+| `test_services.py` | Activity target identity, track/pause semantics, queue dispatch, current-session controls, and failures |
+| `test_blueprints.py` | HA schema validation, optional trigger groups, trigger routing, and actual automation service dispatch |
 
 ## Style checks
 

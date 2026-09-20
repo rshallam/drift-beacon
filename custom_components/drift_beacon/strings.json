@@ -46,6 +46,26 @@
           "description": "Pin the activity again after stopping, so it is ready to resume. Whatever was pinned moves to the front of the queue."
         }
       }
+    },
+    "track_activity": {
+      "name": "Track activity",
+      "description": "For timed activities, start tracking or stop if already running. For point activities, record one occurrence."
+    },
+    "pause_activity": {
+      "name": "Pause activity",
+      "description": "End this activity's live session and pin it for later. Applies to timed activities only. Does nothing if this activity is not live."
+    },
+    "pin_activity": {
+      "name": "Pin activity",
+      "description": "Make this your pinned activity. Your previous pin moves to the front of the queue."
+    },
+    "unpin_activity": {
+      "name": "Unpin activity",
+      "description": "Unpin this activity if it is pinned. With auto-advance on, the next queued activity becomes pinned."
+    },
+    "queue_activity": {
+      "name": "Queue activity",
+      "description": "Add this activity to the back of your queue. With auto-advance on and nothing pinned, pin it immediately. Each call can add another queue entry."
     }
   }
 }

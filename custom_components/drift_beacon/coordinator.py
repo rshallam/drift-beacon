@@ -1010,3 +1010,13 @@ class DriftBeaconWebSocketManager:
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("Failed to unpin activity: %s", err)
             return False
+
+    async def queue_activity(self, activity_id: str) -> bool:
+        """Add an activity to the back of the connection user's queue via RPC."""
+        _LOGGER.debug("Queueing activity %s", activity_id)
+        try:
+            await self._send_rpc("QueueActivity", {"activityId": activity_id})
+            return True
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Failed to queue activity: %s", err)
+            return False

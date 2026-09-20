@@ -1,24 +1,24 @@
 blueprint:
-  name: Drift Beacon Activity Button
+  name: Drift Beacon Activity Controls
   description: >
-    Turn a physical button or remote into a Drift Beacon activity control.
+    Choose how to track an activity and plan what comes next. Add triggers only for
+    the actions you use. Every mapping is optional; add at least one to enable a
+    control. Use any Home Assistant trigger.
 
-    **Press** tracks the activity: a span activity starts (switching from whatever is
-    live) or stops if it is already live; a point activity is marked.
-
-    **Double press** (optional) pins or unpins the activity.
-
-    **Hold** (optional) stops or pauses whatever session is live in the workspace.
-
+    If your device emits overlapping events, such as a press followed by a double
+    press, both mapped actions may run.
   domain: automation
-  source_url: https://github.com/rshallam/drift-beacon/blob/main/ha-integration/blueprints/drift_beacon_activity_button.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  source_url: https://github.com/rshallam/drift-beacon/blob/main/custom_components/drift_beacon/blueprints/drift_beacon_activity_button.yaml
 
   input:
     activity:
       name: Activity
       description: >
-        The activity this button controls. Pick the activity's **Session** switch for
-        a timed activity, or its button for a point activity — not its Pin switch.
+        Choose an entity for the activity you want to control. Its Session switch,
+        Pin switch, or point-activity button all identify the same activity.
+        Do not select the workspace's Stop session button.
       selector:
         entity:
           filter:
@@ -27,101 +27,141 @@ blueprint:
                 - switch
                 - button
 
-    press_trigger:
-      name: Press
-      description: The button action that tracks the activity (e.g. a single press).
-      selector:
-        trigger:
-
-    double_press_trigger:
-      name: Double press (optional)
+    track_now:
+      name: Track now
+      icon: mdi:play-pause
       description: >
-        The button action that pins or unpins the activity. Some remotes also send a
-        single press before a double press — if yours does, pick a different action
-        (such as a long press) so both don't fire.
-      default: []
-      selector:
-        trigger:
+        These actions affect the selected activity. Starting a timed activity ends
+        your other live session; marking a point activity leaves it running.
+      input:
+        track_trigger:
+          name: Track activity
+          description: >
+            For timed activities, start tracking or stop if already running.
+            For point activities, record one occurrence.
+          default: []
+          selector:
+            trigger:
+        pause_trigger:
+          name: Pause activity
+          description: >
+            End this activity's live session and pin it for later.
+            Applies to timed activities only.
+          default: []
+          selector:
+            trigger:
 
-    hold_trigger:
-      name: Hold (optional)
-      description: The button action that ends whatever session is live in the workspace.
-      default: []
-      selector:
-        trigger:
-
-    hold_action:
-      name: Hold action
+    plan_ahead:
+      name: Plan ahead
+      icon: mdi:playlist-plus
+      collapsed: true
       description: >
-        Stop ends the live session. Pause ends it and pins the activity so it is ready
-        to resume (whatever was pinned moves to the front of the queue).
-      default: stop
-      selector:
-        select:
-          mode: dropdown
-          options:
-            - label: Stop
-              value: stop
-            - label: Pause
-              value: pause
+        Keep an activity ready or add it to your queue. These actions don't start tracking.
+      input:
+        pin_trigger:
+          name: Pin activity
+          description: >
+            Make this your pinned activity. Your previous pin moves to the front of the queue.
+          default: []
+          selector:
+            trigger:
+        queue_trigger:
+          name: Queue activity
+          description: >
+            Add this activity to the back of your queue. With auto-advance on and nothing
+            pinned, pin it immediately. Each trigger can add another queue entry.
+          default: []
+          selector:
+            trigger:
+        unpin_trigger:
+          name: Unpin activity
+          description: >
+            Unpin this activity if it is pinned. With auto-advance on, the next queued
+            activity becomes pinned.
+          default: []
+          selector:
+            trigger:
+
+    current_session:
+      name: Current session controls
+      icon: mdi:timer-outline
+      collapsed: true
+      description: >
+        These follow the connected user's live session in this workspace, even when
+        it belongs to a different activity. Ending a shared session ends it for all
+        its members.
+      input:
+        pause_current_trigger:
+          name: Pause current session
+          description: >
+            End your live session and pin its activity to return to later.
+            Your previous pin moves to the front of the queue.
+          default: []
+          selector:
+            trigger:
+        stop_current_trigger:
+          name: Stop current session
+          description: End your live session, whichever activity it belongs to.
+          default: []
+          selector:
+            trigger:
 
 mode: queued
 max: 5
 max_exceeded: silent
 
 triggers:
-  - triggers: !input press_trigger
-  - triggers: !input double_press_trigger
-  - triggers: !input hold_trigger
+  - triggers: !input track_trigger
+  - triggers: !input pause_trigger
+  - triggers: !input pin_trigger
+  - triggers: !input queue_trigger
+  - triggers: !input unpin_trigger
+  - triggers: !input pause_current_trigger
+  - triggers: !input stop_current_trigger
 
 variables:
-  activity_entity: !input activity
-  hold_action: !input hold_action
-  press_triggers: !input press_trigger
-  double_press_triggers: !input double_press_trigger
-  # Nested trigger lists are flattened in order and can't carry an id, so the
-  # gesture is recovered from the trigger's position in the flattened list.
-  gesture: >-
-    {%- set i = trigger.idx | int -%}
-    {%- set presses = press_triggers | length -%}
-    {%- set doubles = double_press_triggers | length -%}
-    {{ 'press' if i < presses else 'double_press' if i < presses + doubles else 'hold' }}
-  workspace_device: "{{ device_id(activity_entity) }}"
-  # The activity's Pin switch is the other switch on the workspace device with the
-  # same activity_id, so renamed entity IDs don't break the lookup.
-  pin_entity: >-
-    {%- set activity_id = state_attr(activity_entity, 'activity_id') -%}
-    {{ device_entities(workspace_device)
-       | select('match', 'switch[.]')
-       | reject('eq', activity_entity)
-       | select('is_state_attr', 'activity_id', activity_id)
-       | first
-       | default('', true) }}
+  trigger_groups:
+    - name: track_activity
+      triggers: !input track_trigger
+    - name: pause_activity
+      triggers: !input pause_trigger
+    - name: pin_activity
+      triggers: !input pin_trigger
+    - name: queue_activity
+      triggers: !input queue_trigger
+    - name: unpin_activity
+      triggers: !input unpin_trigger
+    - name: pause_current
+      triggers: !input pause_current_trigger
+    - name: stop_current
+      triggers: !input stop_current_trigger
+  # Merged trigger lists receive a flat index, independent of user-supplied IDs.
+  # Empty groups contribute no positions; a manual run without a trigger does nothing.
+  activity_action: >-
+    {%- set index = trigger.idx | int(-1) if trigger is defined else -1 -%}
+    {%- set selected = namespace(offset=0, action='') -%}
+    {%- for group in trigger_groups -%}
+      {%- set count = group.triggers | length -%}
+      {%- if selected.offset <= index < selected.offset + count -%}
+        {%- set selected.action = group.name -%}
+      {%- endif -%}
+      {%- set selected.offset = selected.offset + count -%}
+    {%- endfor -%}
+    {{ selected.action }}
 
 actions:
   - choose:
-      - conditions: "{{ gesture == 'press' and activity_entity.startswith('switch.') }}"
+      - conditions: >-
+          {{ activity_action in ['track_activity', 'pause_activity', 'pin_activity',
+                                  'queue_activity', 'unpin_activity'] }}
         sequence:
-          - action: switch.toggle
+          - action: "{{ 'drift_beacon.' ~ activity_action }}"
             target:
-              entity_id: "{{ activity_entity }}"
-
-      - conditions: "{{ gesture == 'press' }}"
-        sequence:
-          - action: button.press
-            target:
-              entity_id: "{{ activity_entity }}"
-
-      - conditions: "{{ gesture == 'double_press' and pin_entity != '' }}"
-        sequence:
-          - action: switch.toggle
-            target:
-              entity_id: "{{ pin_entity }}"
-
-      - conditions: "{{ gesture == 'hold' }}"
+              entity_id: !input activity
+      - conditions: "{{ activity_action in ['pause_current', 'stop_current'] }}"
         sequence:
           - action: drift_beacon.stop_session
             target:
-              device_id: "{{ workspace_device }}"
+              entity_id: !input activity
             data:
-              pause: "{{ hold_action == 'pause' }}"
+              pause: "{{ activity_action == 'pause_current' }}"

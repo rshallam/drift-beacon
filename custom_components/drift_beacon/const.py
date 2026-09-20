@@ -43,6 +43,11 @@ PLATFORMS: Final = ["switch", "sensor", "button"]
 
 # Services
 SERVICE_STOP_SESSION: Final = "stop_session"
+SERVICE_TRACK_ACTIVITY: Final = "track_activity"
+SERVICE_PAUSE_ACTIVITY: Final = "pause_activity"
+SERVICE_PIN_ACTIVITY: Final = "pin_activity"
+SERVICE_UNPIN_ACTIVITY: Final = "unpin_activity"
+SERVICE_QUEUE_ACTIVITY: Final = "queue_activity"
 ATTR_PAUSE: Final = "pause"
 
 # Events

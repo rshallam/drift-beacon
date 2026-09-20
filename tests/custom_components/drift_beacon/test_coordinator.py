@@ -700,3 +700,16 @@ async def test_disconnect_cancels_connection_supervisor() -> None:
 
     assert task.cancelled()
     assert manager._connection_task is None
+
+
+@pytest.mark.asyncio
+async def test_queue_activity_rpc_payload_and_failure() -> None:
+    """Queue uses the existing server RPC and reports a rejected request."""
+    manager, _ = create_manager()
+    manager._send_rpc = AsyncMock(return_value=None)
+    assert await manager.queue_activity("activity-1")
+    manager._send_rpc.assert_awaited_once_with(
+        "QueueActivity", {"activityId": "activity-1"}
+    )
+    manager._send_rpc.side_effect = RuntimeError("Disconnected")
+    assert not await manager.queue_activity("activity-1")

@@ -2,6 +2,21 @@
   "services": {
     "stop_session": {
       "service": "mdi:stop-circle-outline"
+    },
+    "track_activity": {
+      "service": "mdi:play-pause"
+    },
+    "pause_activity": {
+      "service": "mdi:pause-circle-outline"
+    },
+    "pin_activity": {
+      "service": "mdi:pin"
+    },
+    "unpin_activity": {
+      "service": "mdi:pin-off"
+    },
+    "queue_activity": {
+      "service": "mdi:playlist-plus"
     }
   }
 }

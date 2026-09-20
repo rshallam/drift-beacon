@@ -9,6 +9,20 @@ service_port=${SERVICE_PORT:-9823}
 service_protocol=${SERVICE_PROTOCOL:-http}
 nginx_port_https=${NGINX_PORT_HTTPS:-9000}
 nginx_port_http=${NGINX_PORT_HTTP:-9001}
+
+# Detect kernel IPv6 support. The Supervisor "hassio" bridge is dual-stack since
+# Supervisor 2026.04, and docker-proxy accepts connections on [::] for every
+# published port. If nginx only listens on IPv4 those connections are accepted
+# and then immediately reset, which breaks hostname access (e.g.
+# https://homeassistant.local:9000) on IPv6-preferring clients. Bind both
+# families when the kernel supports it, and stay IPv4-only when it does not so
+# nginx cannot fail to start.
+if [ -f /proc/net/if_inet6 ]; then
+    ipv6=true
+else
+    ipv6=false
+fi
+bashio::log.info "nginx IPv6 listeners: ${ipv6}"
 certfile="/ssl/$(jq -r '.certfile' $OPTIONS_SOURCE)"
 keyfile="/ssl/$(jq -r '.keyfile' $OPTIONS_SOURCE)"
 
@@ -50,8 +64,9 @@ printf '{
   "port": "%s",
   "http_port": "%s",
   "protocol": "%s",
-  "ssl": %s
-}' "$certfile" "$keyfile" "$nginx_port_https" "$nginx_port_http" "$service_protocol" "$(jq -r '.ssl' $OPTIONS_SOURCE)" \
+  "ssl": %s,
+  "ipv6": %s
+}' "$certfile" "$keyfile" "$nginx_port_https" "$nginx_port_http" "$service_protocol" "$(jq -r '.ssl' $OPTIONS_SOURCE)" "$ipv6" \
     | tempio \
         -template /etc/nginx/templates/direct.gtpl \
         -out /etc/nginx/servers/direct.conf
