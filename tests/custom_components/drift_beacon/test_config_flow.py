@@ -1,256 +1,170 @@
-"""Tests for Drift Beacon authentication flows."""
+"""Config, reauth and reconfigure flows against the fake server."""
 
 from __future__ import annotations
 
-import json
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
-
-import aiohttp
 import pytest
-from homeassistant.const import CONF_HOST, CONF_PORT
+from homeassistant.config_entries import SOURCE_USER
+from homeassistant.const import CONF_HOST, CONF_PORT, CONF_VERIFY_SSL
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import FlowResultType
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
-from custom_components.drift_beacon.config_flow import DriftBeaconConfigFlow
 from custom_components.drift_beacon.const import (
     CONF_API_TOKEN,
-    CONF_HUB_ID,
     CONF_PROTOCOL,
     CONF_USER_ID,
-    CONF_USER_NAME,
     CONF_WORKSPACE_ID,
-    CONF_WORKSPACE_NAME,
+    DOMAIN,
 )
 
-CONNECTION_INFO = {
-    "workspaceId": "workspace-1",
-    "workspaceName": "Personal",
-    "userId": "user-1",
-    "userName": "Rich",
-}
+from .conftest import TOKEN, USER_ID, WORKSPACE_ID, FakeDriftBeacon
 
 
-@pytest.mark.asyncio
-async def test_connection_info_rpc_returns_workspace_and_user(
-    monkeypatch: pytest.MonkeyPatch,
+def _user_input(server: FakeDriftBeacon, **overrides: object) -> dict[str, object]:
+    return {
+        CONF_HOST: "127.0.0.1",
+        CONF_PORT: server.port,
+        CONF_VERIFY_SSL: True,
+        CONF_API_TOKEN: TOKEN,
+        **overrides,
+    }
+
+
+async def test_user_flow_creates_a_workspace_entry(
+    hass: HomeAssistant, server: FakeDriftBeacon
 ) -> None:
-    """Setup identity is read from the authenticated WebSocket RPC."""
-    websocket = SimpleNamespace(
-        send_json=AsyncMock(),
-        receive=AsyncMock(
-            return_value=SimpleNamespace(
-                type=aiohttp.WSMsgType.TEXT,
-                data=json.dumps({"jsonrpc": "2.0", "id": 1, "result": CONNECTION_INFO}),
-            )
-        ),
-        close=AsyncMock(),
+    """The token decides the workspace and user; plain http is detected."""
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
     )
-    session = SimpleNamespace(ws_connect=AsyncMock(return_value=websocket))
-    monkeypatch.setattr(
-        "custom_components.drift_beacon.config_flow.async_get_clientsession",
-        lambda _hass: session,
+    assert result["type"] is FlowResultType.FORM
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], _user_input(server)
     )
-    flow = DriftBeaconConfigFlow()
-    flow.hass = object()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["title"] == "Home"
+    assert result["result"].unique_id == WORKSPACE_ID
+    assert result["data"][CONF_PROTOCOL] == "http"
+    assert result["data"][CONF_WORKSPACE_ID] == WORKSPACE_ID
+    assert result["data"][CONF_USER_ID] == USER_ID
+    await hass.config_entries.async_unload(result["result"].entry_id)
 
-    result = await flow._get_connection_info(
-        "https", "example.test", 9000, "workspace-token"
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [(401, "invalid_auth"), (403, "invalid_auth"), (503, "cannot_connect")],
+)
+async def test_user_flow_maps_handshake_errors(
+    hass: HomeAssistant, server: FakeDriftBeacon, status: int, error: str
+) -> None:
+    """A rejected token is an auth error; a server outage is not."""
+    server.handshake_status = status
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
     )
-
-    assert result == CONNECTION_INFO
-    websocket.send_json.assert_awaited_once_with(
-        {
-            "jsonrpc": "2.0",
-            "method": "GetConnectionInfo",
-            "params": {},
-            "id": 1,
-        }
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], _user_input(server)
     )
-    websocket.close.assert_awaited_once()
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": error}
 
 
-def access_error(status: int) -> aiohttp.ClientResponseError:
-    """Build an HTTP error raised when WebSocket upgrade is rejected."""
-    return aiohttp.ClientResponseError(
-        request_info=SimpleNamespace(real_url="https://example.test/api/ws"),
-        history=(),
-        status=status,
-        message="Invalid API key or workspace access denied",
+async def test_user_flow_without_a_server(
+    hass: HomeAssistant, server: FakeDriftBeacon
+) -> None:
+    """Nothing answering as Drift Beacon is reported as the wrong address."""
+    port = server.port
+    await server.stop()
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
     )
-
-
-def configured_user_flow(
-    connection_info: dict[str, str], hub_id: str = "hub-1"
-) -> DriftBeaconConfigFlow:
-    """Build a config flow with server and identity discovery stubbed."""
-    flow = DriftBeaconConfigFlow()
-    flow.context = {"source": "user"}
-    flow._detected_hub = {}
-    flow._detect_protocol_parallel = AsyncMock(
-        return_value=("https", {"device": {"id": hub_id, "name": "Beacon"}})
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {**_user_input(server), CONF_PORT: port}
     )
-    flow._get_connection_info = AsyncMock(return_value=connection_info)
-
-    async def set_unique_id(value: str) -> None:
-        flow.context["unique_id"] = value
-
-    flow.async_set_unique_id = AsyncMock(side_effect=set_unique_id)
-    return flow
+    assert result["errors"] == {"base": "invalid_server"}
 
 
-@pytest.mark.asyncio
-async def test_same_hub_supports_distinct_workspace_entries() -> None:
-    """Globally unique workspace IDs create independent config entries."""
-    first = configured_user_flow(CONNECTION_INFO)
-    first._async_current_entries = Mock(return_value=[])
-    second = configured_user_flow(
-        {
-            **CONNECTION_INFO,
-            "workspaceId": "workspace-2",
-            "workspaceName": "Family",
-        }
+async def test_one_entry_per_workspace(
+    hass: HomeAssistant, server: FakeDriftBeacon, config_entry: MockConfigEntry
+) -> None:
+    """Adding the same workspace again aborts."""
+    config_entry.add_to_hass(hass)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
     )
-    second._async_current_entries = Mock(return_value=[])
-    user_input = {
-        CONF_HOST: "example.test",
-        CONF_PORT: 9000,
-        CONF_API_TOKEN: "token",
-    }
-
-    first_result = await first.async_step_user(user_input)
-    second_result = await second.async_step_user(user_input)
-
-    assert first.unique_id == "workspace-1"
-    assert second.unique_id == "workspace-2"
-    assert first_result["title"] == "Personal"
-    assert second_result["title"] == "Family"
-    assert first_result["data"][CONF_HUB_ID] == "hub-1"
-    assert first_result["data"][CONF_USER_NAME] == "Rich"
-
-
-@pytest.mark.asyncio
-async def test_duplicate_workspace_identifies_the_connected_user() -> None:
-    """A workspace stays unique even when discovered through another hub."""
-    flow = configured_user_flow(
-        {**CONNECTION_INFO, "userId": "user-2", "userName": "Priya"},
-        hub_id="replacement-hub",
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], _user_input(server)
     )
-    flow._async_current_entries = Mock(
-        return_value=[
-            SimpleNamespace(unique_id="workspace-1", data={CONF_USER_NAME: "Rich"})
-        ]
-    )
-
-    result = await flow.async_step_user(
-        {
-            CONF_HOST: "example.test",
-            CONF_PORT: 9000,
-            CONF_API_TOKEN: "second-user-token",
-        }
-    )
-
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
-    assert result["description_placeholders"] == {"user_name": "Rich"}
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status", [401, 403])
-async def test_user_flow_reports_invalid_credentials(status: int) -> None:
-    """An auth rejection during configuration should show invalid_auth."""
-    flow = DriftBeaconConfigFlow()
-    flow._detected_hub = {}
-    flow._detect_protocol_parallel = AsyncMock(
-        return_value=("https", {"device": {"id": "hub-1", "name": "Drift Beacon"}})
+async def test_reauth_accepts_a_new_token_for_the_same_user(
+    hass: HomeAssistant, server: FakeDriftBeacon, config_entry: MockConfigEntry
+) -> None:
+    """Reauth replaces the token and reloads."""
+    config_entry.add_to_hass(hass)
+    result = await config_entry.start_reauth_flow(hass)
+    assert result["step_id"] == "reauth_confirm"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_TOKEN: TOKEN}
     )
-    flow._get_connection_info = AsyncMock(side_effect=access_error(status))
-
-    result = await flow.async_step_user(
-        {
-            CONF_HOST: "example.test",
-            CONF_PORT: 9000,
-            CONF_API_TOKEN: "invalid",
-        }
-    )
-
-    assert result["errors"] == {"base": "invalid_auth"}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("status", [401, 403])
-async def test_reauth_flow_reports_invalid_credentials(status: int) -> None:
-    """A rejected replacement token should keep reauthentication open."""
-    flow = DriftBeaconConfigFlow()
-    flow._reauth_entry_data = {
-        CONF_HOST: "example.test",
-        CONF_PORT: 9000,
-        CONF_PROTOCOL: "https",
-        CONF_WORKSPACE_ID: "workspace-1",
-        CONF_WORKSPACE_NAME: "Personal",
-        CONF_USER_ID: "user-1",
-        CONF_USER_NAME: "Rich",
-    }
-    flow._get_connection_info = AsyncMock(side_effect=access_error(status))
-
-    result = await flow.async_step_reauth_confirm({CONF_API_TOKEN: "still-invalid"})
-
-    assert result["errors"] == {"base": "invalid_auth"}
-
-
-@pytest.mark.asyncio
-async def test_valid_reauth_token_updates_and_reloads_entry() -> None:
-    """A valid replacement token should update and reload the config entry."""
-    flow = DriftBeaconConfigFlow()
-    flow._reauth_entry_data = {
-        CONF_HOST: "example.test",
-        CONF_PORT: 9000,
-        CONF_PROTOCOL: "https",
-        CONF_WORKSPACE_ID: "workspace-1",
-        CONF_WORKSPACE_NAME: "Personal",
-        CONF_USER_ID: "user-1",
-        CONF_USER_NAME: "Rich",
-    }
-    flow._get_connection_info = AsyncMock(
-        return_value={**CONNECTION_INFO, "userId": "user-2", "userName": "Priya"}
-    )
-    entry = object()
-    flow._get_reauth_entry = Mock(return_value=entry)
-    flow.hass = SimpleNamespace(
-        config_entries=SimpleNamespace(async_update_entry=Mock())
-    )
-    flow.async_update_reload_and_abort = Mock(
-        return_value={"type": "abort", "reason": "reauth_successful"}
-    )
-
-    result = await flow.async_step_reauth_confirm({CONF_API_TOKEN: "replacement-token"})
-
+    assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
-    flow.async_update_reload_and_abort.assert_called_once_with(
-        entry,
-        data_updates={
-            CONF_API_TOKEN: "replacement-token",
-            CONF_WORKSPACE_NAME: "Personal",
-            CONF_USER_ID: "user-2",
-            CONF_USER_NAME: "Priya",
-        },
+    await hass.async_block_till_done()
+    await hass.config_entries.async_unload(config_entry.entry_id)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [("workspaceId", "ws-2", "wrong_workspace"), ("userId", "user-2", "wrong_user")],
+)
+async def test_reauth_rejects_a_token_for_someone_else(
+    hass: HomeAssistant,
+    server: FakeDriftBeacon,
+    config_entry: MockConfigEntry,
+    field: str,
+    value: str,
+    error: str,
+) -> None:
+    """A token for another workspace or user would silently change who the entry acts for."""
+    config_entry.add_to_hass(hass)
+    server.snapshot[field] = value
+    result = await config_entry.start_reauth_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_API_TOKEN: TOKEN}
     )
-    flow.hass.config_entries.async_update_entry.assert_called_once_with(
-        entry, title="Personal"
+    assert result["errors"] == {"base": error}
+
+
+async def test_reconfigure_changes_the_address(
+    hass: HomeAssistant, server: FakeDriftBeacon, config_entry: MockConfigEntry
+) -> None:
+    """Host, port and TLS verification can change without re-adding the entry."""
+    config_entry.add_to_hass(hass)
+    result = await config_entry.start_reconfigure_flow(hass)
+    assert result["step_id"] == "reconfigure"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "127.0.0.1", CONF_PORT: server.port, CONF_VERIFY_SSL: False},
     )
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    assert config_entry.data[CONF_VERIFY_SSL] is False
+    await hass.async_block_till_done()
+    await hass.config_entries.async_unload(config_entry.entry_id)
 
 
-@pytest.mark.asyncio
-async def test_reauth_rejects_a_token_for_another_workspace() -> None:
-    """Reauthentication may replace the user but never the workspace."""
-    flow = DriftBeaconConfigFlow()
-    flow._reauth_entry_data = {
-        CONF_HOST: "example.test",
-        CONF_PORT: 9000,
-        CONF_PROTOCOL: "https",
-        CONF_WORKSPACE_ID: "workspace-1",
-    }
-    flow._get_connection_info = AsyncMock(
-        return_value={**CONNECTION_INFO, "workspaceId": "workspace-2"}
+async def test_reconfigure_refuses_a_different_workspace(
+    hass: HomeAssistant, server: FakeDriftBeacon, config_entry: MockConfigEntry
+) -> None:
+    """Pointing the entry at a server where the token means another workspace aborts."""
+    config_entry.add_to_hass(hass)
+    server.snapshot["workspaceId"] = "ws-2"
+    result = await config_entry.start_reconfigure_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_HOST: "127.0.0.1", CONF_PORT: server.port, CONF_VERIFY_SSL: True},
     )
-
-    result = await flow.async_step_reauth_confirm({CONF_API_TOKEN: "wrong-workspace"})
-
-    assert result["errors"] == {"base": "wrong_workspace"}
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "wrong_workspace"

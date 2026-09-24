@@ -1,49 +1,28 @@
-stop_session:
+# Targets are devices only: entities are hidden, and Home Assistant skips hidden entities
+# when it expands a device, so the integration resolves activity devices itself.
+track_activity: &activity_service
   target:
     device:
       integration: drift_beacon
-  fields:
-    pause:
-      default: false
-      selector:
-        boolean:
-
-track_activity:
-  target:
-    entity:
-      integration: drift_beacon
-      domain:
-        - switch
-        - button
+      model: Activity
 
 pause_activity:
   target:
-    entity:
+    device:
       integration: drift_beacon
-      domain:
-        - switch
-        - button
+      model: Activity
+      model_id: span
 
-pin_activity:
-  target:
-    entity:
-      integration: drift_beacon
-      domain:
-        - switch
-        - button
+pin_activity: *activity_service
 
-unpin_activity:
-  target:
-    entity:
-      integration: drift_beacon
-      domain:
-        - switch
-        - button
+unpin_activity: *activity_service
 
-queue_activity:
+queue_activity: *activity_service
+
+stop_session: &workspace_service
   target:
-    entity:
+    device:
       integration: drift_beacon
-      domain:
-        - switch
-        - button
+      model: Workspace
+
+pause_session: *workspace_service

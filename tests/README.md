@@ -1,86 +1,43 @@
 # Testing the Drift Beacon Home Assistant integration
 
-The tests in this directory are focused unit tests for the custom integration in
-`custom_components/drift_beacon`. They import Home Assistant's public classes and constants, but
-they do not require a running Drift Beacon server. Blueprint tests create a local
-Home Assistant instance to validate and execute automation sequences with recorded service calls.
+The suite runs the integration inside a real Home Assistant instance using
+[pytest-homeassistant-custom-component](https://github.com/MatthewFlamm/pytest-homeassistant-custom-component),
+against a fake Drift Beacon server (`conftest.py`) that speaks the real `/api/ws` JSON-RPC
+protocol over a local WebSocket. Nothing talks to a real server.
 
-## Current setup
+## Running
 
-The repository currently has no `pyproject.toml`, Python dependency lockfile, `pytest.ini`, or
-shared `conftest.py`. The test environment is therefore created on demand with
-[uv](https://docs.astral.sh/uv/):
-
-- `homeassistant` supplies the integration APIs and types used by the component.
-- `pytest` is the test runner.
-- `pytest-asyncio` runs tests marked with `@pytest.mark.asyncio`.
-- `PYTHONPATH=.` makes the repository's `custom_components` package importable.
-
-Tests use small in-memory collaborators such as `FakeHomeAssistant`, `FakeConfigEntry`, and
-`FakeManager`, together with `unittest.mock`. Network connections, WebSocket messages, Home
-Assistant's event bus, and coordinator RPCs are simulated locally.
-
-## Running the tests
-
-From the repository root, run the complete suite with:
+From the repository root (the plugin version pins Home Assistant 2026.9.3 and needs Python 3.14):
 
 ```sh
-uv run --with homeassistant --with pytest --with pytest-asyncio \
-  env PYTHONPATH=. pytest -q tests/custom_components/drift_beacon
+uv run --no-project --python 3.14 \
+  --with pytest-homeassistant-custom-component==0.13.366 \
+  env PYTHONPATH=. pytest -q tests
 ```
 
-Some authentication tests are parameterized for both HTTP 401 and 403 responses.
+`pyproject.toml` holds the pytest settings (`asyncio_mode = "auto"` is required by the
+plugin). Add `-k <name>` to select tests, or a file path to run one module.
 
-Run one test module by replacing the final path:
+## Layout
 
-```sh
-uv run --with homeassistant --with pytest --with pytest-asyncio \
-  env PYTHONPATH=. pytest -q tests/custom_components/drift_beacon/test_sensor.py
-```
-
-Run one test by its pytest node ID:
-
-```sh
-uv run --with homeassistant --with pytest --with pytest-asyncio \
-  env PYTHONPATH=. pytest -q \
-  tests/custom_components/drift_beacon/test_coordinator.py::test_snapshot_restores_availability_and_replaces_state
-```
-
-Remove `-q` for more runner output, or add `-vv` to show every collected case.
-
-## Test organization
-
-| File | Coverage |
+| File | Covers |
 | --- | --- |
-| `test_config_flow.py` | Invalid credentials, reauthentication, and config-entry updates |
-| `test_coordinator.py` | Connection lifecycle, retry behavior, identity snapshots, events, pin state, and RPC payloads |
-| `test_sensor.py` | Workspace sensor discovery and pinned-activity sensor state |
-| `test_switch.py` | Session/pin switch discovery, single pinned slot behavior, and RPC calls |
-| `test_services.py` | Activity target identity, track/pause semantics, queue dispatch, current-session controls, and failures |
-| `test_blueprints.py` | HA schema validation, optional trigger groups, trigger routing, and actual automation service dispatch |
+| `conftest.py` | `FakeDriftBeacon` server, config entry and setup fixtures, `wait_for` |
+| `test_models.py` | State reducer, colour parsing |
+| `test_init.py` | Setup errors, device model, hidden entities, unload, legacy entries, device deletion |
+| `test_coordinator.py` | Events, focus, reconnect diffs, grace period, malformed input, device rename/type change/removal |
+| `test_entities.py` | Switch, button and sensor state and actions, error propagation, write-on-change |
+| `test_services.py` | Device-target resolution and rejection, per-service RPCs, multi-target failures |
+| `test_config_flow.py` | User, reauth and reconfigure flows |
+| `test_device_trigger.py` | Device triggers, diagnostics redaction |
+| `test_blueprints.py` | Blueprint schemas; each blueprint run as a real automation |
 
-## Style checks
+The WebSocket reader runs outside Home Assistant's task tracking, so tests that wait on
+pushed server messages use `wait_for(predicate)` instead of `hass.async_block_till_done()`.
 
-Ruff is also run without a repository-local Python environment:
+## Style
 
 ```sh
-uvx ruff check custom_components/drift_beacon tests/custom_components/drift_beacon
-uvx ruff format --check custom_components/drift_beacon tests/custom_components/drift_beacon
+uvx ruff check custom_components tests
+uvx ruff format --check custom_components tests
 ```
-
-To apply Ruff's formatter, omit `--check` from the second command.
-
-## Adding a test
-
-Keep new tests under `tests/custom_components/drift_beacon` and mirror the component module name
-where practical. For async behavior, mark the test explicitly:
-
-```python
-@pytest.mark.asyncio
-async def test_example() -> None:
-    ...
-```
-
-Prefer deterministic fakes and mocks over real network or Home Assistant runtime state. If a
-future test needs Home Assistant's full fixture-based test harness, add and document that setup
-separately; the current suite does not provide fixtures such as `hass` or `MockConfigEntry`.

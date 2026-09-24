@@ -1,1022 +1,442 @@
-"""WebSocket manager for Drift Beacon integration."""
+"""Push coordinator: owns the WebSocket connection, the workspace state and the actions."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-from collections.abc import Callable
-from contextlib import suppress
-from typing import Any, TypedDict
+import random
+import time
+from collections.abc import AsyncIterator
+from dataclasses import replace
+from typing import Any
 
-import aiohttp
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers import device_registry as dr
+from homeassistant.const import CONF_HOST, CONF_PORT, CONF_VERIFY_SSL
+from homeassistant.core import CALLBACK_TYPE, CoreState, HomeAssistant, callback
+from homeassistant.exceptions import (
+    ConfigEntryAuthFailed,
+    ConfigEntryNotReady,
+    HomeAssistantError,
+)
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.start import async_at_started
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+from .api import (
+    DriftBeaconAuthError,
+    DriftBeaconClient,
+    DriftBeaconError,
+    DriftBeaconRpcError,
+    DriftBeaconWorkspaceNotFoundError,
+)
 from .const import (
-    API_TIMEOUT,
     CONF_API_TOKEN,
-    CONF_HOST,
-    CONF_PORT,
     CONF_PROTOCOL,
     CONF_USER_ID,
-    CONF_USER_NAME,
     CONF_WORKSPACE_ID,
-    CONF_WORKSPACE_NAME,
     DOMAIN,
-    EVENT_ACTIVITY_PINNED,
-    EVENT_ACTIVITY_UNPINNED,
-    EVENT_SESSION_CHANGED,
-    EVENT_SESSION_STARTED,
-    EVENT_SESSION_STOPPED,
-    WS_PATH,
-    WS_RECONNECT_MAX_DELAY,
-    WS_RECONNECT_MIN_DELAY,
+    REASON_NO_LIVE_SESSION,
+    REASON_NOT_PINNED,
+    RECONNECT_MAX_DELAY,
+    RECONNECT_MIN_DELAY,
+    REQUEST_TIMEOUT,
+    STABLE_CONNECTION_TIME,
+    UNAVAILABLE_GRACE_PERIOD,
+    WORKSPACE_MISSING_RETRY_DELAY,
 )
+from .devices import DeviceManager
+from .events import EventBuilder, Focus, focus_of
+from .models import PointMark, WorkspaceState, apply_message
 
 _LOGGER = logging.getLogger(__name__)
 
+type DriftBeaconConfigEntry = ConfigEntry[DriftBeaconCoordinator]
 
-class _SubscriptionError(Exception):
-    """Raised when the server rejects or does not initialize a subscription."""
-
-
-# ============================================================================
-# Data Models
-# ============================================================================
+ISSUE_WORKSPACE_NOT_FOUND = "workspace_not_found"
 
 
-class ActivityProgress(TypedDict):
-    """Activity progress data."""
-
-    current: float
-    target: float | None
+def workspace_issue_id(entry_id: str) -> str:
+    """Repair issue raised while an entry's workspace cannot be found."""
+    return f"{ISSUE_WORKSPACE_NOT_FOUND}_{entry_id}"
 
 
-class Activity(TypedDict):
-    """Activity data from WebSocket API."""
-
-    id: str
-    name: str
-    description: str | None
-    category_id: str | None
-    sort_order: int
-    color: str  # hex color e.g. "#4A90D9"
-    icon: str
-    tracking_type: str  # "span" | "point"
-    archived: bool
-    unit: str | None
-    progress: ActivityProgress
+class IdentityMismatchError(DriftBeaconError):
+    """The token now resolves to a different workspace or user than the entry was set up for."""
 
 
-class Category(TypedDict):
-    """Category data from WebSocket API."""
-
-    id: str
-    name: str
-    color: str  # hex color
-    icon: str
-    sort_order: int
-
-
-class Workspace(TypedDict):
-    """Workspace data from WebSocket API."""
-
-    id: str
-    name: str
-
-
-class LiveSession(TypedDict):
-    """Live session data from WebSocket API."""
-
-    id: str
-    activity_id: str
-    start_time: str  # ISO 8601
-
-
-class PinnedActivity(TypedDict):
-    """Pinned activity data from WebSocket API."""
-
-    activity_id: str
-    pinned_at: str  # ISO 8601
-
-
-type DriftBeaconConfigEntry = ConfigEntry["DriftBeaconWebSocketManager"]
-
-
-# ============================================================================
-# Color Conversion
-# ============================================================================
-
-
-def hex_to_rgb(hex_color: str) -> list[int]:
-    """Convert hex color string to RGB list. e.g. '#4A90D9' -> [74, 144, 217]."""
-    h = hex_color.lstrip("#")
-    return [int(h[i : i + 2], 16) for i in (0, 2, 4)]
-
-
-# ============================================================================
-# Parsing Helpers (camelCase → snake_case)
-# ============================================================================
-
-
-def _parse_activity(data: dict[str, Any]) -> Activity:
-    """Parse a raw activity dict from the WebSocket API."""
-    progress_raw = data.get("progress", {})
-    return Activity(
-        id=data["id"],
-        name=data["name"],
-        description=data.get("description"),
-        category_id=data.get("categoryId"),
-        sort_order=data.get("sortOrder", 0),
-        color=data.get("color", "#808080"),
-        icon=data.get("icon", "mdi:circle"),
-        tracking_type=data.get("trackingType", "span"),
-        archived=data.get("archived", False),
-        unit=data.get("unit"),
-        progress=ActivityProgress(
-            current=progress_raw.get("current", 0),
-            target=progress_raw.get("target"),
-        ),
-    )
-
-
-def _parse_category(data: dict[str, Any]) -> Category:
-    """Parse a raw category dict from the WebSocket API."""
-    return Category(
-        id=data["id"],
-        name=data["name"],
-        color=data.get("color", "#808080"),
-        icon=data.get("icon", "mdi:circle"),
-        sort_order=data.get("sortOrder", 0),
-    )
-
-
-def _parse_workspace(data: dict[str, Any]) -> Workspace:
-    """Parse a raw workspace dict from the WebSocket API."""
-    return Workspace(id=data["id"], name=data["name"])
-
-
-def _parse_live_session(data: dict[str, Any]) -> LiveSession:
-    """Parse a raw live session dict from the WebSocket API."""
-    return LiveSession(
-        id=data["id"],
-        activity_id=data.get("activityId", ""),
-        start_time=data.get("startTime", ""),
-    )
-
-
-def _parse_pinned_activity(data: dict[str, Any]) -> PinnedActivity:
-    """Parse a raw pinned activity dict from the WebSocket API."""
-    return PinnedActivity(
-        activity_id=data.get("activityId", ""),
-        pinned_at=data.get("pinnedAt", ""),
-    )
-
-
-# ============================================================================
-# WebSocket Manager
-# ============================================================================
-
-
-class DriftBeaconWebSocketManager:
-    """Manages WebSocket connection and state for the Drift Beacon integration."""
+class DriftBeaconCoordinator(DataUpdateCoordinator[WorkspaceState]):
+    """Holds the workspace state; the server pushes every change, nothing is polled."""
 
     config_entry: DriftBeaconConfigEntry
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        """Initialize the WebSocket manager."""
-        self.hass = hass
-        self.config_entry = entry
-        self.session_token: str = entry.data[CONF_API_TOKEN]
-        self.host: str = entry.data[CONF_HOST]
-        self.port: int = entry.data[CONF_PORT]
-        self.protocol: str = entry.data.get(CONF_PROTOCOL, "https")
+    def __init__(self, hass: HomeAssistant, entry: DriftBeaconConfigEntry) -> None:
+        """Set up state; call :meth:`async_start` to connect."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name=f"{DOMAIN} {entry.title}",
+            update_interval=None,
+        )
         self.workspace_id: str = entry.data[CONF_WORKSPACE_ID]
-        self.workspace_name: str = entry.data[CONF_WORKSPACE_NAME]
         self.user_id: str = entry.data[CONF_USER_ID]
-        self.user_name: str = entry.data[CONF_USER_NAME]
-
-        # State for this config entry's workspace
-        self._workspaces: list[Workspace] = []
-        self._workspace_activities: dict[str, dict[str, Activity]] = {}
-        self._workspace_categories: dict[str, dict[str, Category]] = {}
-        self._workspace_live_sessions: dict[str, LiveSession | None] = {}
-        self._workspace_pinned_activities: dict[str, PinnedActivity | None] = {}
-
-        # Connection
-        self._ws: aiohttp.ClientWebSocketResponse | None = None
-        self._rpc_id: int = 0
-        self._connection_task: asyncio.Task | None = None
-        self._initial_ready: asyncio.Future[None] | None = None
-        self._reconnect_attempt: int = 0
-        self._intentional_disconnect: bool = False
-        self._pending_responses: dict[int, asyncio.Future] = {}
-        self._subscription_rpc_id: int | None = None
-
-        # HA integration
-        self._listeners: list[Callable] = []
-        self._available: bool = False
-
-    # ========================================================================
-    # Public State Properties
-    # ========================================================================
-
-    @property
-    def available(self) -> bool:
-        """Return True when connected and data has been received."""
-        return self._available
-
-    @property
-    def device_info(self) -> dict[str, Any]:
-        """Return the virtual workspace device shared by all entities."""
-        return {"identifiers": {(DOMAIN, self.workspace_id)}}
-
-    @property
-    def user_attributes(self) -> dict[str, str]:
-        """Return the token owner's public entity attributes."""
-        return {"user_id": self.user_id, "user_name": self.user_name}
-
-    @property
-    def workspaces(self) -> list[Workspace]:
-        """Return all workspaces."""
-        return list(self._workspaces)
-
-    @property
-    def activities(self) -> list[Activity]:
-        """Return a flat list of all activities across workspaces."""
-        result: list[Activity] = []
-        for acts in self._workspace_activities.values():
-            result.extend(acts.values())
-        return result
-
-    def get_activity(self, activity_id: str) -> Activity | None:
-        """Look up an activity by ID across all workspaces."""
-        for acts in self._workspace_activities.values():
-            if activity_id in acts:
-                return acts[activity_id]
-        return None
-
-    def get_category(self, category_id: str | None) -> Category | None:
-        """Look up a category by ID across all workspaces."""
-        if category_id is None:
-            return None
-        for cats in self._workspace_categories.values():
-            if category_id in cats:
-                return cats[category_id]
-        return None
-
-    def get_workspace_for_activity(self, activity_id: str) -> Workspace | None:
-        """Get the workspace that contains a given activity."""
-        for ws_id, acts in self._workspace_activities.items():
-            if activity_id in acts:
-                return self._get_workspace_by_id(ws_id)
-        return None
-
-    def get_live_session(self, workspace_id: str) -> LiveSession | None:
-        """Get the live session for a workspace."""
-        return self._workspace_live_sessions.get(workspace_id)
-
-    def get_pinned_activity(self, workspace_id: str) -> PinnedActivity | None:
-        """Get the pinned activity for a workspace."""
-        return self._workspace_pinned_activities.get(workspace_id)
-
-    def get_activities(self, workspace_id: str) -> list[Activity]:
-        """Return activities belonging to one workspace."""
-        return list(self._workspace_activities.get(workspace_id, {}).values())
-
-    def _get_workspace_by_id(self, workspace_id: str) -> Workspace | None:
-        """Get a workspace by its ID."""
-        for ws in self._workspaces:
-            if ws["id"] == workspace_id:
-                return ws
-        return None
-
-    # ========================================================================
-    # Listener Management
-    # ========================================================================
-
-    @callback
-    def async_add_listener(self, update_callback: Callable) -> Callable:
-        """Add a listener and return a removal callable."""
-        self._listeners.append(update_callback)
-
-        @callback
-        def remove_listener() -> None:
-            if update_callback in self._listeners:
-                self._listeners.remove(update_callback)
-
-        return remove_listener
-
-    @callback
-    def _notify_listeners(self) -> None:
-        """Notify all registered listeners of a state change."""
-        for listener in self._listeners:
-            listener()
-
-    # ========================================================================
-    # Connection Lifecycle
-    # ========================================================================
-
-    async def async_connect(self) -> None:
-        """Start the connection supervisor and wait for the first snapshot."""
-        if self._connection_task and not self._connection_task.done():
-            return
-
-        self._intentional_disconnect = False
-        self._initial_ready = self.hass.loop.create_future()
-        self._connection_task = self.hass.async_create_task(
-            self._connection_supervisor(), f"{DOMAIN}_ws_connection"
+        self.devices = DeviceManager(hass, entry, self.workspace_id)
+        self._client: DriftBeaconClient | None = None
+        self._stream: AsyncIterator[list[dict[str, Any]]] | None = None
+        self._cancel_unavailable: CALLBACK_TYPE | None = None
+        self._last_focus: Focus | None = None
+        self._closing = False
+        self._events = EventBuilder(
+            self.workspace_id,
+            lambda: self.devices.workspace_device_id,
+            self.devices.activity_device_id,
         )
 
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def async_start(self) -> None:
+        """Connect and apply the first snapshot, then keep the connection in the background.
+
+        Raises the config entry exceptions Home Assistant expects from setup.
+        """
         try:
-            await self._initial_ready
-        except asyncio.CancelledError:
-            await self.async_disconnect()
-            raise
-        except (ConfigEntryAuthFailed, ConfigEntryNotReady):
-            await self.async_disconnect()
-            raise
-        finally:
-            self._initial_ready = None
-
-    def _websocket_url(self) -> str:
-        """Return the configured WebSocket URL."""
-        ws_scheme = "wss" if self.protocol == "https" else "ws"
-        return f"{ws_scheme}://{self.host}:{self.port}{WS_PATH}"
-
-    async def _open_connection(self) -> None:
-        """Open and authenticate a WebSocket connection."""
-        ws_url = self._websocket_url()
-        _LOGGER.debug("Connecting to WebSocket at %s", ws_url)
-        http_session = async_get_clientsession(self.hass)
-
-        try:
-            self._ws = await http_session.ws_connect(
-                ws_url,
-                headers={"Authorization": f"Bearer {self.session_token}"},
-                ssl=False,
-                heartbeat=30,
-                timeout=aiohttp.ClientTimeout(total=API_TIMEOUT),
-            )
-        except aiohttp.ClientResponseError as err:
-            if err.status in (401, 403):
-                raise ConfigEntryAuthFailed(
-                    "Drift Beacon API token is invalid, expired, "
-                    "or no longer grants workspace access"
-                ) from err
-            raise
-
-        _LOGGER.info("WebSocket connected to %s", ws_url)
-
-    async def _setup_subscription(self) -> None:
-        """Subscribe to the workspace scoped by the API key."""
-        if self._ws is None or self._ws.closed:
-            raise ConnectionError("WebSocket is not connected")
-
-        rpc_id = self._next_rpc_id()
-        self._subscription_rpc_id = rpc_id
-
-        request = {
-            "jsonrpc": "2.0",
-            "method": "Subscribe",
-            "params": {},
-            "id": rpc_id,
-        }
-
-        _LOGGER.debug("Subscribing (rpc_id=%d)", rpc_id)
-        await self._ws.send_json(request)
-
-    async def _connection_supervisor(self) -> None:
-        """Maintain the connection until the integration is unloaded."""
-        while not self._intentional_disconnect:
-            try:
-                await self._open_connection()
-                await self._setup_subscription()
-                await asyncio.wait_for(
-                    self._receive_until_snapshot(), timeout=API_TIMEOUT
-                )
-
-                if self._initial_ready and not self._initial_ready.done():
-                    self._initial_ready.set_result(None)
-
-                await self._listen_loop()
-            except asyncio.CancelledError:
-                raise
-            except ConfigEntryAuthFailed as err:
-                self._intentional_disconnect = True
-                await self._cleanup_connection(err)
-                if self._initial_ready and not self._initial_ready.done():
-                    self._initial_ready.set_exception(err)
-                else:
-                    _LOGGER.warning(
-                        "Drift Beacon API token is invalid, expired, or no longer "
-                        "grants workspace access; reauthentication is required"
-                    )
-                    self.config_entry.async_start_reauth(self.hass)
-                return
-            except Exception as err:  # noqa: BLE001  # noqa: BLE001
-                await self._cleanup_connection(
-                    ConnectionError(f"WebSocket connection lost: {err}")
-                )
-
-                if self._initial_ready and not self._initial_ready.done():
-                    self._initial_ready.set_exception(
-                        ConfigEntryNotReady(f"Unable to connect to Drift Beacon: {err}")
-                    )
-                    return
-
-                delay = self._next_reconnect_delay()
-                _LOGGER.warning(
-                    "WebSocket connection lost; reconnect attempt %d in %.1fs: %s",
-                    self._reconnect_attempt,
-                    delay,
-                    err,
-                )
-                await asyncio.sleep(delay)
-            finally:
-                if self._intentional_disconnect:
-                    await self._cleanup_connection(
-                        ConnectionError("WebSocket disconnected")
-                    )
-
-    def _next_reconnect_delay(self) -> float:
-        """Return the next capped exponential delay."""
-        delay = min(
-            WS_RECONNECT_MIN_DELAY * (2**self._reconnect_attempt),
-            WS_RECONNECT_MAX_DELAY,
-        )
-        self._reconnect_attempt += 1
-        return float(delay)
-
-    async def async_disconnect(self) -> None:
-        """Gracefully disconnect from the WebSocket."""
-        self._intentional_disconnect = True
-
-        if self._ws and not self._ws.closed:
-            # Best-effort unsubscribe
-            try:
-                rpc_id = self._next_rpc_id()
-                await asyncio.wait_for(
-                    self._ws.send_json(
-                        {
-                            "jsonrpc": "2.0",
-                            "method": "Unsubscribe",
-                            "params": {},
-                            "id": rpc_id,
-                        }
-                    ),
-                    timeout=2,
-                )
-            except Exception:  # noqa: BLE001, S110
-                pass
-
-        connection_task = self._connection_task
-        if connection_task and connection_task is not asyncio.current_task():
-            connection_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await connection_task
-        self._connection_task = None
-
-        await self._cleanup_connection(ConnectionError("WebSocket disconnected"))
-
-    async def _cleanup_connection(self, error: Exception) -> None:
-        """Close the socket and fail requests owned by this connection."""
-        was_available = self._available
-        self._available = False
-
-        ws = self._ws
-        self._ws = None
-        if ws and not ws.closed:
-            try:
-                await ws.close()
-            except Exception as err:  # noqa: BLE001  # noqa: BLE001
-                _LOGGER.debug("Error while closing WebSocket: %s", err)
-
-        for future in self._pending_responses.values():
-            if not future.done():
-                future.set_exception(error)
-        self._pending_responses.clear()
-        self._subscription_rpc_id = None
-
-        if was_available:
-            self._notify_listeners()
-
-    # ========================================================================
-    # JSON-RPC Client
-    # ========================================================================
-
-    def _next_rpc_id(self) -> int:
-        """Get the next RPC request ID."""
-        self._rpc_id += 1
-        return self._rpc_id
-
-    async def _send_rpc(self, method: str, params: dict | None = None) -> Any:
-        """Send a JSON-RPC request and await the non-stream response."""
-        if self._ws is None or self._ws.closed:
-            raise ConnectionError("WebSocket is not connected")
-
-        rpc_id = self._next_rpc_id()
-        future: asyncio.Future = self.hass.loop.create_future()
-        self._pending_responses[rpc_id] = future
-
-        request = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-            "id": rpc_id,
-        }
-
-        _LOGGER.debug("Sending RPC: %s (id=%d)", method, rpc_id)
-        try:
-            await self._ws.send_json(request)
-            return await asyncio.wait_for(future, timeout=API_TIMEOUT)
-        finally:
-            self._pending_responses.pop(rpc_id, None)
-            if not future.done():
-                future.cancel()
-
-    # ========================================================================
-    # Message Listening
-    # ========================================================================
-
-    async def _listen_loop(self) -> None:
-        """Main WebSocket message receive loop."""
-        if self._ws is None:
-            raise ConnectionError("WebSocket is not connected")
-
-        async for msg in self._ws:
-            self._process_websocket_message(msg)
-
-        raise ConnectionError("WebSocket closed")
-
-    async def _receive_until_snapshot(self) -> None:
-        """Receive subscription messages until a valid snapshot arrives."""
-        if self._ws is None:
-            raise ConnectionError("WebSocket is not connected")
-
-        while not self._available:
-            msg = await self._ws.receive()
-            self._process_websocket_message(msg)
-
-    def _process_websocket_message(self, msg: aiohttp.WSMessage) -> None:
-        """Process one WebSocket frame or raise when the connection ends."""
-        if msg.type == aiohttp.WSMsgType.TEXT:
-            self._handle_message(msg.data)
-            return
-        if msg.type == aiohttp.WSMsgType.ERROR:
-            error = self._ws.exception() if self._ws else None
-            raise ConnectionError(f"WebSocket error: {error}")
-        if msg.type in (
-            aiohttp.WSMsgType.CLOSE,
-            aiohttp.WSMsgType.CLOSING,
-            aiohttp.WSMsgType.CLOSED,
-        ):
-            raise ConnectionError("WebSocket closed")
-
-    @callback
-    def _handle_message(self, raw: str) -> None:
-        """Parse a JSON-RPC response and route it."""
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            _LOGGER.warning("Received non-JSON WebSocket message")
-            return
-
-        # Check for errors
-        if "error" in data:
-            rpc_id = data.get("id")
-            error_msg = data["error"].get("message", "Unknown error")
-            _LOGGER.error("RPC error (id=%s): %s", rpc_id, error_msg)
-
-            if rpc_id and rpc_id in self._pending_responses:
-                self._pending_responses.pop(rpc_id).set_exception(
-                    Exception(f"RPC error: {error_msg}")
-                )
-            elif rpc_id == self._subscription_rpc_id:
-                raise _SubscriptionError(error_msg)
-            return
-
-        is_chunked = data.get("chunk", False)
-        rpc_id = data.get("id")
-
-        if is_chunked:
-            # Stream messages from Subscribe
-            if rpc_id != self._subscription_rpc_id:
-                _LOGGER.debug("Received chunked message for unknown rpc_id=%s", rpc_id)
-                return
-
-            results = data.get("result", [])
-            for msg in results:
-                self._apply_stream_message(msg)
-            self._notify_listeners()
-        else:
-            # Non-stream RPC response (StartSession, StopSession, etc.)
-            if rpc_id and rpc_id in self._pending_responses:
-                self._pending_responses.pop(rpc_id).set_result(data.get("result"))
-
-    # ========================================================================
-    # Stream Message Handlers
-    # ========================================================================
-
-    def _apply_stream_message(self, msg: dict[str, Any]) -> None:
-        """Apply a single stream message to local state."""
-        tag = msg.get("_tag")
-        if not tag:
-            return
-
-        handler = {
-            "Snapshot": self._apply_snapshot,
-            "ActivityCreated": self._apply_activity_created,
-            "ActivityUpdated": self._apply_activity_updated,
-            "ActivityDeleted": self._apply_activity_deleted,
-            "CategoryCreated": self._apply_category_created,
-            "CategoryUpdated": self._apply_category_updated,
-            "CategoryDeleted": self._apply_category_deleted,
-            "SessionStarted": self._apply_session_started,
-            "SessionEnded": self._apply_session_ended,
-            "PinnedActivityChanged": self._apply_pinned_activity_changed,
-        }.get(tag)
-
-        if handler:
-            handler(msg)
-        else:
-            _LOGGER.debug("Unknown stream message tag: %s", tag)
-
-    def _apply_snapshot(self, msg: dict[str, Any]) -> None:
-        """Apply a Snapshot message — full state replacement for the workspace."""
-        workspace_id = msg.get("workspaceId", "")
-        workspace_name = msg.get("workspaceName", workspace_id)
-        user_id = msg.get("userId", "")
-        user_name = msg.get("userName", user_id)
-        if workspace_id != self.workspace_id:
+            await self._async_open()
+        except (DriftBeaconAuthError, IdentityMismatchError) as err:
             raise ConfigEntryAuthFailed(
-                "The API token resolved to a different Drift Beacon workspace"
+                translation_domain=DOMAIN, translation_key="auth_failed"
+            ) from err
+        except DriftBeaconWorkspaceNotFoundError as err:
+            # The server also answers 404 while it cannot load the workspace, which can recover.
+            self._async_create_workspace_issue()
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN, translation_key="workspace_not_found"
+            ) from err
+        except (DriftBeaconError, TimeoutError) as err:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+                translation_placeholders={"error": str(err) or type(err).__name__},
+            ) from err
+
+        self.config_entry.async_on_unload(
+            async_at_started(self.hass, self._async_fire_initial_focus)
+        )
+        self.config_entry.async_create_background_task(
+            self.hass, self._async_run(), f"{DOMAIN} {self.workspace_id} connection"
+        )
+
+    async def _async_update_data(self) -> WorkspaceState:
+        """Serve ``homeassistant.update_entity``: the pushed state is always current."""
+        if self.data is None or self._client is None or not self._client.connected:
+            raise UpdateFailed(
+                translation_domain=DOMAIN, translation_key="not_connected"
             )
-        self._refresh_connection_metadata(workspace_name, user_id, user_name)
+        return self.data
 
-        # Populate workspace list from Snapshot
-        self._workspaces = [Workspace(id=workspace_id, name=workspace_name)]
+    async def async_shutdown(self) -> None:
+        """Close the connection when the entry unloads."""
+        self._closing = True
+        await super().async_shutdown()
+        self._cancel_unavailable_timer()
+        if self._client is not None:
+            await self._client.close()
+            self._client = None
 
-        activities_raw = msg.get("activities", [])
-        categories_raw = msg.get("categories", [])
-        # Snapshot carries a `liveSessions` array; the API token scopes Subscribe
-        # to one workspace/user, so at most one entry is relevant.
-        live_sessions_raw = msg.get("liveSessions", [])
-        live_session_raw = live_sessions_raw[0] if live_sessions_raw else None
-        pinned_activity_raw = msg.get("pinnedActivity")
-
-        # The API token scopes Subscribe to one workspace, so each Snapshot
-        # replaces all state retained from the previous connection.
-        self._workspace_activities.clear()
-        self._workspace_categories.clear()
-        self._workspace_live_sessions.clear()
-        self._workspace_pinned_activities.clear()
-
-        self._workspace_activities[workspace_id] = {
-            a["id"]: _parse_activity(a) for a in activities_raw
-        }
-        self._workspace_categories[workspace_id] = {
-            c["id"]: _parse_category(c) for c in categories_raw
-        }
-        self._workspace_live_sessions[workspace_id] = (
-            _parse_live_session(live_session_raw) if live_session_raw else None
-        )
-        self._workspace_pinned_activities[workspace_id] = (
-            _parse_pinned_activity(pinned_activity_raw) if pinned_activity_raw else None
+    def _new_client(self) -> DriftBeaconClient:
+        data = self.config_entry.data
+        return DriftBeaconClient(
+            async_get_clientsession(self.hass, verify_ssl=data[CONF_VERIFY_SSL]),
+            protocol=data[CONF_PROTOCOL],
+            host=data[CONF_HOST],
+            port=data[CONF_PORT],
+            api_token=data[CONF_API_TOKEN],
         )
 
-        self._available = True
-        self._reconnect_attempt = 0
+    async def _async_open(self) -> None:
+        """Connect, subscribe and apply the chunk carrying the Snapshot."""
+        client = self._new_client()
+        try:
+            await client.connect()
+            stream = client.subscribe()
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                first = await anext(stream)
+            if not first or first[0].get("_tag") != "Snapshot":
+                raise DriftBeaconError("Subscription did not start with a Snapshot")
+            self._check_identity(first[0])
+        except BaseException:
+            await client.close()
+            raise
+        self._client, self._stream = client, stream
+        ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
+        self._apply_chunk(first)
 
-        _LOGGER.debug(
-            "Snapshot received for workspace %s (%s): %d activities, %d categories, live_session=%s, pinned_activity=%s",
-            workspace_name,
-            workspace_id,
-            len(activities_raw),
-            len(categories_raw),
-            "yes" if live_session_raw else "no",
-            pinned_activity_raw.get("activityId") if pinned_activity_raw else "none",
-        )
-
-    def _refresh_connection_metadata(
-        self, workspace_name: str, user_id: str, user_name: str
-    ) -> None:
-        """Refresh friendly names while preserving workspace identity."""
-        self.workspace_name = workspace_name
-        self.user_id = user_id
-        self.user_name = user_name
-        new_data = {
-            **self.config_entry.data,
-            CONF_WORKSPACE_NAME: workspace_name,
-            CONF_USER_ID: user_id,
-            CONF_USER_NAME: user_name,
-        }
+    def _check_identity(self, snapshot: dict[str, Any]) -> None:
         if (
-            new_data != self.config_entry.data
-            or self.config_entry.title != workspace_name
+            snapshot.get("workspaceId") != self.workspace_id
+            or snapshot.get("userId") != self.user_id
         ):
-            self.hass.config_entries.async_update_entry(
-                self.config_entry, data=new_data, title=workspace_name
+            raise IdentityMismatchError(
+                "The access token now belongs to a different workspace or user"
             )
-        device_registry = dr.async_get(self.hass)
-        device = device_registry.async_get_device(
-            identifiers={(DOMAIN, self.workspace_id)}
-        )
-        if device is not None and device.name != workspace_name:
-            device_registry.async_update_device(device.id, name=workspace_name)
 
-    def _apply_activity_created(self, msg: dict[str, Any]) -> None:
-        activity = _parse_activity(msg["activity"])
-        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        self._workspace_activities.setdefault(ws_id, {})[activity["id"]] = activity
-        _LOGGER.debug("Activity created: %s (%s)", activity["name"], activity["id"])
+    async def _async_run(self) -> None:
+        """Consume the stream; reconnect with backoff until auth fails or the entry unloads."""
+        attempt = 0
+        opened_at = time.monotonic()
+        while True:
+            if self._stream is not None:
+                try:
+                    async for chunk in self._stream:
+                        try:
+                            self._apply_chunk(chunk)
+                        except IdentityMismatchError:
+                            raise
+                        except Exception:
+                            # A bug in handling one update must not cost the connection.
+                            _LOGGER.exception("Error applying a Drift Beacon update")
+                except DriftBeaconError as err:
+                    _LOGGER.debug("Drift Beacon stream ended: %s", err)
+                finally:
+                    if self._client is not None:
+                        await self._client.close()
+                    self._client = self._stream = None
+                if self._closing:
+                    return
+                self._async_connection_lost()
+                # Only a connection that stayed up resets the backoff, so a server that
+                # accepts and immediately drops the subscription is not hammered.
+                if time.monotonic() - opened_at >= STABLE_CONNECTION_TIME:
+                    attempt = 0
 
-    def _apply_activity_updated(self, msg: dict[str, Any]) -> None:
-        activity = _parse_activity(msg["activity"])
-        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        self._workspace_activities.setdefault(ws_id, {})[activity["id"]] = activity
-        _LOGGER.debug("Activity updated: %s (%s)", activity["name"], activity["id"])
-
-    def _apply_activity_deleted(self, msg: dict[str, Any]) -> None:
-        activity_id = msg["activityId"]
-        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        acts = self._workspace_activities.get(ws_id, {})
-        acts.pop(activity_id, None)
-        _LOGGER.debug("Activity deleted: %s", activity_id)
-
-    def _apply_category_created(self, msg: dict[str, Any]) -> None:
-        category = _parse_category(msg["category"])
-        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        self._workspace_categories.setdefault(ws_id, {})[category["id"]] = category
-
-    def _apply_category_updated(self, msg: dict[str, Any]) -> None:
-        category = _parse_category(msg["category"])
-        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        self._workspace_categories.setdefault(ws_id, {})[category["id"]] = category
-
-    def _apply_category_deleted(self, msg: dict[str, Any]) -> None:
-        cat_id = msg["categoryId"]
-        ws_id = self._workspaces[0]["id"] if self._workspaces else ""
-        cats = self._workspace_categories.get(ws_id, {})
-        cats.pop(cat_id, None)
-
-    def _apply_session_started(self, msg: dict[str, Any]) -> None:
-        workspace = self._workspaces[0] if self._workspaces else None
-        ws_id = workspace["id"] if workspace else ""
-        prev_session = self._workspace_live_sessions.get(ws_id)
-        new_session = _parse_live_session(msg["session"])
-        self._workspace_live_sessions[ws_id] = new_session
-
-        activity = self.get_activity(new_session["activity_id"])
-
-        if activity and workspace:
-            category = self.get_category(activity.get("category_id"))
-
-            event_data: dict[str, Any] = {
-                "activity_id": activity["id"],
-                "activity_name": activity["name"],
-                "color": hex_to_rgb(activity["color"]),
-                "icon": activity["icon"],
-                "category_id": activity.get("category_id"),
-                "category_name": category["name"] if category else None,
-                "category_icon": category["icon"] if category else None,
-                "category_color": hex_to_rgb(category["color"]) if category else None,
-                "workspace_id": workspace["id"],
-                "workspace_name": workspace["name"],
-                "session_start_time": new_session["start_time"],
-            }
-
-            if (
-                prev_session
-                and prev_session["activity_id"] != new_session["activity_id"]
-            ):
-                # Session changed (different activity)
-                prev_activity = self.get_activity(prev_session["activity_id"])
-                event_data["previous_activity_id"] = prev_session["activity_id"]
-                event_data["previous_activity_name"] = (
-                    prev_activity["name"] if prev_activity else None
+            delay = min(RECONNECT_MIN_DELAY * 2**attempt, RECONNECT_MAX_DELAY)
+            delay *= random.uniform(0.8, 1.2)
+            attempt += 1
+            await asyncio.sleep(delay)
+            try:
+                await self._async_open()
+            except DriftBeaconAuthError, IdentityMismatchError:
+                _LOGGER.warning(
+                    "Drift Beacon rejected the access token; reauthentication required"
                 )
-                self.hass.bus.async_fire(EVENT_SESSION_CHANGED, event_data)
-                _LOGGER.debug(
-                    "Session changed: %s -> %s",
-                    prev_activity["name"] if prev_activity else "unknown",
-                    activity["name"],
-                )
-            else:
-                self.hass.bus.async_fire(EVENT_SESSION_STARTED, event_data)
-                _LOGGER.debug("Session started: %s", activity["name"])
-
-    def _apply_session_ended(self, msg: dict[str, Any]) -> None:
-        session_id = msg["sessionId"]
-        activity_id = msg["activityId"]
-        workspace = self._workspaces[0] if self._workspaces else None
-        ws_id = workspace["id"] if workspace else ""
-        self._workspace_live_sessions[ws_id] = None
-
-        activity = self.get_activity(activity_id)
-
-        if activity and workspace:
-            # Include the currently pinned activity (if any) so automations can
-            # fall back to pinned lighting instead of turning off outright —
-            # session lighting always took priority while the session was live.
-            pinned = self.get_pinned_activity(workspace["id"])
-            pinned_activity = (
-                self.get_activity(pinned["activity_id"]) if pinned else None
-            )
-
-            self.hass.bus.async_fire(
-                EVENT_SESSION_STOPPED,
-                {
-                    "activity_id": activity_id,
-                    "activity_name": activity["name"],
-                    "workspace_id": workspace["id"],
-                    "workspace_name": workspace["name"],
-                    "pinned_activity_id": pinned["activity_id"] if pinned else None,
-                    "pinned_activity_name": (
-                        pinned_activity["name"] if pinned_activity else None
-                    ),
-                    "pinned_color": (
-                        hex_to_rgb(pinned_activity["color"])
-                        if pinned_activity
-                        else None
-                    ),
-                },
-            )
-            _LOGGER.debug(
-                "Session ended: %s (session %s)", activity["name"], session_id
-            )
-
-    def _apply_pinned_activity_changed(self, msg: dict[str, Any]) -> None:
-        """Apply the current authenticated user's pinned activity.
-
-        Fires `drift_beacon_activity_pinned`/`_unpinned` for automations, tagged
-        with whether a live session is active right now. This lets lighting
-        automations suppress the pinned light while a session is showing —
-        `Activity.startSession` implicitly unpins, so starting a session on
-        an already-pinned activity fires both a session-started and a
-        unpinned message; `has_live_session` here is read fresh, after
-        `_apply_session_started` would already have updated
-        `_workspace_live_sessions`, so the unpin is correctly seen as a
-        no-op for lighting purposes. Pinned state itself is still recorded
-        here regardless of `has_live_session`, so if the session later ends,
-        `_apply_session_ended` finds this activity still pinned and hands
-        lighting back to it instead of turning off.
-        """
-        workspace = self._workspaces[0] if self._workspaces else None
-        if workspace is None:
-            return
-
-        workspace_id = workspace["id"]
-        previous = self._workspace_pinned_activities.get(workspace_id)
-        pinned_activity_raw = msg.get("pinnedActivity")
-        new = (
-            _parse_pinned_activity(pinned_activity_raw) if pinned_activity_raw else None
-        )
-        self._workspace_pinned_activities[workspace_id] = new
-
-        _LOGGER.debug(
-            "Pinned activity changed: %s",
-            pinned_activity_raw.get("activityId") if pinned_activity_raw else "none",
-        )
-
-        previous_activity_id = previous["activity_id"] if previous else None
-        new_activity_id = new["activity_id"] if new else None
-        if previous_activity_id == new_activity_id:
-            return
-
-        has_live_session = self.get_live_session(workspace_id) is not None
-
-        if new is not None:
-            activity = self.get_activity(new["activity_id"])
-            if activity is None:
+                self._async_mark_unavailable()
+                self.config_entry.async_start_reauth(self.hass)
                 return
-            category = self.get_category(activity.get("category_id"))
-            self.hass.bus.async_fire(
-                EVENT_ACTIVITY_PINNED,
-                {
-                    "activity_id": activity["id"],
-                    "activity_name": activity["name"],
-                    "color": hex_to_rgb(activity["color"]),
-                    "icon": activity["icon"],
-                    "category_id": activity.get("category_id"),
-                    "category_name": category["name"] if category else None,
-                    "category_icon": category["icon"] if category else None,
-                    "category_color": (
-                        hex_to_rgb(category["color"]) if category else None
-                    ),
-                    "workspace_id": workspace["id"],
-                    "workspace_name": workspace["name"],
-                    "pinned_at": new["pinned_at"],
-                    "has_live_session": has_live_session,
-                },
-            )
-        elif previous is not None:
-            previous_activity = self.get_activity(previous["activity_id"])
-            self.hass.bus.async_fire(
-                EVENT_ACTIVITY_UNPINNED,
-                {
-                    "activity_id": previous["activity_id"],
-                    "activity_name": (
-                        previous_activity["name"] if previous_activity else None
-                    ),
-                    "workspace_id": workspace["id"],
-                    "workspace_name": workspace["name"],
-                    "has_live_session": has_live_session,
-                },
-            )
+            except DriftBeaconWorkspaceNotFoundError:
+                self._async_create_workspace_issue()
+                await asyncio.sleep(WORKSPACE_MISSING_RETRY_DELAY)
+            except (DriftBeaconError, TimeoutError) as err:
+                log = _LOGGER.warning if attempt == 1 else _LOGGER.debug
+                log("Cannot reconnect to Drift Beacon (attempt %d): %s", attempt, err)
+            else:
+                if self._closing:
+                    # Unloaded while reconnecting; the snapshot was not applied.
+                    if self._client is not None:
+                        await self._client.close()
+                    self._client = self._stream = None
+                    return
+                opened_at = time.monotonic()
+                if attempt > 1:
+                    _LOGGER.info("Reconnected to Drift Beacon")
 
-    # ========================================================================
+    @property
+    def _issue_id(self) -> str:
+        return workspace_issue_id(self.config_entry.entry_id)
+
+    @callback
+    def _async_create_workspace_issue(self) -> None:
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            self._issue_id,
+            is_fixable=False,
+            severity=ir.IssueSeverity.ERROR,
+            translation_key=ISSUE_WORKSPACE_NOT_FOUND,
+            translation_placeholders={"title": self.config_entry.title},
+        )
+
+    @callback
+    def _async_connection_lost(self) -> None:
+        """Keep entities available briefly, so a quick reconnect does not flap them."""
+        self._cancel_unavailable_timer()
+        self._cancel_unavailable = async_call_later(
+            self.hass, UNAVAILABLE_GRACE_PERIOD, self._async_grace_expired
+        )
+
+    @callback
+    def _async_grace_expired(self, _now: Any) -> None:
+        self._cancel_unavailable = None
+        self._async_mark_unavailable()
+
+    @callback
+    def _async_mark_unavailable(self) -> None:
+        self._cancel_unavailable_timer()
+        if self.last_update_success:
+            self.async_set_update_error(DriftBeaconError("Disconnected"))
+
+    def _cancel_unavailable_timer(self) -> None:
+        if self._cancel_unavailable is not None:
+            self._cancel_unavailable()
+            self._cancel_unavailable = None
+
+    # ------------------------------------------------------------------
+    # State
+    # ------------------------------------------------------------------
+
+    @callback
+    def _apply_chunk(self, messages: list[dict[str, Any]]) -> None:
+        """Reduce one chunk, publish the result once, then fire events and sync devices."""
+        if self._closing:
+            return
+        prev = self.data
+        state = prev
+        full = False
+        for msg in messages:
+            try:
+                if msg.get("_tag") == "Snapshot":
+                    self._check_identity(msg)
+                    state = WorkspaceState.from_snapshot(msg)
+                    full = True
+                elif state is not None:
+                    state = apply_message(state, msg)
+            except IdentityMismatchError:
+                raise
+            except (KeyError, TypeError, ValueError, AttributeError) as err:
+                # One malformed message must not cost the connection.
+                _LOGGER.warning(
+                    "Ignoring malformed %s message: %r", msg.get("_tag"), err
+                )
+        if state is None:
+            return
+
+        marks = state.marks
+        if marks:
+            state = replace(state, marks=())
+        self._cancel_unavailable_timer()
+        if state is not prev or not self.last_update_success:
+            self.async_set_updated_data(state)
+        # Events first: they look up device ids that the sync may remove.
+        self._async_fire_events(prev, state, marks)
+        self.devices.async_sync(prev, state, full=full)
+
+    @callback
+    def _async_fire_events(
+        self,
+        prev: WorkspaceState | None,
+        state: WorkspaceState,
+        marks: tuple[PointMark, ...],
+    ) -> None:
+        for event_type, data in self._events.transitions(prev, state, marks):
+            self.hass.bus.async_fire(event_type, data)
+        if self.hass.state is not CoreState.running:
+            # The first focus is announced once Home Assistant has started, when automations
+            # are listening (see _async_fire_initial_focus).
+            return
+        focus = focus_of(state)
+        if self._last_focus is None or focus != self._last_focus:
+            self.hass.bus.async_fire(
+                *self._events.focus_changed(
+                    focus,
+                    self._last_focus,
+                    state,
+                    initial=self._last_focus is None,
+                )
+            )
+            self._last_focus = focus
+
+    @callback
+    def _async_fire_initial_focus(self, _hass: HomeAssistant) -> None:
+        """Announce the current focus once, so lights resync after a restart."""
+        if self.data is None or self._last_focus is not None:
+            return
+        focus = focus_of(self.data)
+        self.hass.bus.async_fire(
+            *self._events.focus_changed(focus, None, self.data, initial=True)
+        )
+        self._last_focus = focus
+
+    # ------------------------------------------------------------------
     # Actions
-    # ========================================================================
+    # ------------------------------------------------------------------
 
-    async def start_session(self, activity_id: str) -> bool:
-        """Start a span session for an activity via RPC."""
-        _LOGGER.debug("Starting session for activity %s", activity_id)
-        try:
-            await self._send_rpc(
-                "StartSession",
-                {"activityId": activity_id},
+    async def _async_rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        ignore: tuple[str, ...] = (),
+    ) -> Any:
+        client = self._client
+        if client is None or not client.connected:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="not_connected"
             )
-            return True
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to start session: %s", err)
-            return False
-
-    async def stop_session(self, activity_id: str | None = None) -> bool:
-        """Stop a live session via RPC.
-
-        When ``activity_id`` is given, stop that activity's live session. When
-        omitted, stop whatever session is live for this user (idempotent — the
-        server returns success even if nothing is running).
-        """
-        _LOGGER.debug("Stopping session for activity %s", activity_id or "<any>")
         try:
-            params = {"activityId": activity_id} if activity_id is not None else {}
-            await self._send_rpc("StopSession", params)
-            return True
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to stop session: %s", err)
-            return False
+            return await client.rpc(method, params)
+        except DriftBeaconRpcError as err:
+            if err.reason in ignore:
+                return None
+            raise HomeAssistantError(
+                translation_domain=DOMAIN,
+                translation_key="action_failed",
+                translation_placeholders={
+                    "action": method,
+                    "reason": err.reason,
+                    "message": err.message,
+                },
+            ) from err
+        except DriftBeaconError as err:
+            raise HomeAssistantError(
+                translation_domain=DOMAIN, translation_key="not_connected"
+            ) from err
 
-    async def pause_session(self, activity_id: str | None = None) -> bool:
-        """End a live session and re-pin its activity via RPC.
+    async def async_track(self, activity_id: str) -> None:
+        """Stop a live span, start an idle one, or mark a point activity."""
+        await self._async_rpc("TrackActivity", {"activityId": activity_id})
 
-        Mirrors ``stop_session``: when ``activity_id`` is omitted, pause whatever
-        session is live for this user (idempotent when nothing is running).
-        """
-        _LOGGER.debug("Pausing session for activity %s", activity_id or "<any>")
-        try:
-            params = {"activityId": activity_id} if activity_id is not None else {}
-            await self._send_rpc("PauseSession", params)
-            return True
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to pause session: %s", err)
-            return False
+    async def async_start_session(self, activity_id: str) -> None:
+        """Start a span activity (restarts it if already live; callers guard)."""
+        await self._async_rpc("StartSession", {"activityId": activity_id})
 
-    async def mark_activity(self, activity_id: str) -> bool:
-        """Mark a point activity via RPC."""
-        _LOGGER.debug("Marking activity %s", activity_id)
-        try:
-            await self._send_rpc(
-                "Mark",
-                {"activityId": activity_id},
-            )
-            return True
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to mark activity: %s", err)
-            return False
+    async def async_stop_session(self, activity_id: str) -> None:
+        """Stop the live session of an activity; nothing live is not an error."""
+        await self._async_rpc(
+            "StopSession", {"activityId": activity_id}, ignore=(REASON_NO_LIVE_SESSION,)
+        )
 
-    async def pin_activity(self, activity_id: str) -> bool:
-        """Pin an activity via RPC."""
-        _LOGGER.debug("Pinning activity %s", activity_id)
-        try:
-            await self._send_rpc("PinActivity", {"activityId": activity_id})
-            return True
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to pin activity: %s", err)
-            return False
+    async def async_pause_session(self, activity_id: str) -> None:
+        """End an activity's live session and pin it; nothing live is not an error."""
+        await self._async_rpc(
+            "PauseSession",
+            {"activityId": activity_id},
+            ignore=(REASON_NO_LIVE_SESSION,),
+        )
 
-    async def unpin_activity(self, activity_id: str | None = None) -> bool:
-        """Unpin an activity, or whichever activity is pinned when omitted."""
-        _LOGGER.debug("Unpinning activity %s", activity_id or "<any>")
-        try:
-            params = {"activityId": activity_id} if activity_id is not None else {}
-            await self._send_rpc("UnpinActivity", params)
-            return True
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to unpin activity: %s", err)
-            return False
+    async def async_mark(self, activity_id: str) -> None:
+        """Record one occurrence of a point activity."""
+        await self._async_rpc("Mark", {"activityId": activity_id})
 
-    async def queue_activity(self, activity_id: str) -> bool:
-        """Add an activity to the back of the connection user's queue via RPC."""
-        _LOGGER.debug("Queueing activity %s", activity_id)
-        try:
-            await self._send_rpc("QueueActivity", {"activityId": activity_id})
-            return True
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("Failed to queue activity: %s", err)
-            return False
+    async def async_pin(self, activity_id: str) -> None:
+        """Pin an activity; the previous pin moves to the front of the queue."""
+        await self._async_rpc("PinActivity", {"activityId": activity_id})
+
+    async def async_unpin(self, activity_id: str) -> None:
+        """Unpin an activity if it is the pinned one."""
+        await self._async_rpc(
+            "UnpinActivity", {"activityId": activity_id}, ignore=(REASON_NOT_PINNED,)
+        )
+
+    async def async_queue(self, activity_id: str) -> None:
+        """Add an activity to the back of the queue."""
+        await self._async_rpc("QueueActivity", {"activityId": activity_id})
+
+    async def async_stop_current_session(self) -> None:
+        """Stop whatever session is live for the connection user."""
+        await self._async_rpc("StopSession")
+
+    async def async_pause_current_session(self) -> None:
+        """Pause whatever session is live for the connection user."""
+        await self._async_rpc("PauseSession")

@@ -1,31 +1,35 @@
 blueprint:
   name: Drift Beacon Activity Lighting
   description: >
-    Event-driven automation for controlling lights based on Drift Beacon sessions and
-    pinned activities.
-
+    Colour lights after what you are doing in Drift Beacon: bright in the activity's colour
+    while a session is live, dim in the pinned activity's colour when something is pinned, and
+    off otherwise. Resyncs when Home Assistant starts and after reconnecting.
   domain: automation
-  source_url: https://github.com/rshallam/drift-beacon/blob/main/ha-integration/blueprints/drift_beacon_activity_lighting_events.yaml
+  homeassistant:
+    min_version: "2026.9.0"
+  source_url: https://github.com/rshallam/drift-beacon/blob/main/custom_components/drift_beacon/blueprints/drift_beacon_activity_lighting.yaml
 
   input:
     workspace:
       name: Workspace
-      description: Select the Drift Beacon workspace whose activity events should control these lights
+      description: The Drift Beacon workspace whose activity controls these lights.
       selector:
         device:
-          integration: drift_beacon
+          filter:
+            - integration: drift_beacon
+              model: Workspace
 
     target_lights:
-      name: Target Lights
-      description: The lights or light groups to control based on active activity
+      name: Lights
+      description: The lights or light groups to control.
       selector:
         target:
           entity:
             - domain: light
 
     session_brightness:
-      name: Session Brightness
-      description: Brightness level for the lights while a session is live (0-100%)
+      name: Session brightness
+      description: Brightness while a session is live.
       default: 100
       selector:
         number:
@@ -35,8 +39,8 @@ blueprint:
           mode: slider
 
     pinned_brightness:
-      name: Pinned Brightness
-      description: Brightness level for the lights when an activity is pinned but no session is live (0-100%)
+      name: Pinned brightness
+      description: Brightness when an activity is pinned and no session is live.
       default: 5
       selector:
         number:
@@ -46,32 +50,32 @@ blueprint:
           mode: slider
 
     transition:
-      name: Transition Time
-      description: Time to transition between colors (in seconds)
+      name: Transition
+      description: Seconds to fade between colours.
       default: 0
       selector:
         number:
           min: 0
           max: 10
+          step: 0.5
           unit_of_measurement: "s"
           mode: slider
-          step: 0.5
 
     off_transition:
-      name: Turn Off Transition Time
-      description: Time to transition when turning off lights (in seconds)
+      name: Turn-off transition
+      description: Seconds to fade out when nothing is live or pinned.
       default: 0
       selector:
         number:
           min: 0
           max: 10
+          step: 0.5
           unit_of_measurement: "s"
           mode: slider
-          step: 0.5
 
     disable_when:
-      name: Disable When (Optional)
-      description: Pause activity lighting when these conditions are met. Leave empty to always run.
+      name: Disable when (optional)
+      description: Leave the lights alone while these conditions hold. Leave empty to always run.
       default: []
       selector:
         condition:
@@ -79,179 +83,39 @@ blueprint:
 mode: restart
 max_exceeded: silent
 
-variables:
-  workspace_device: !input workspace
-  selected_workspace_id: >-
-    {%- set selected = namespace(id='') -%}
-    {%- for domain, identifier in device_attr(workspace_device, 'identifiers') or [] -%}
-      {%- if domain == 'drift_beacon' -%}
-        {%- set selected.id = identifier -%}
-      {%- endif -%}
-    {%- endfor -%}
-    {{ selected.id }}
-  session_brightness: !input session_brightness
-  pinned_brightness: !input pinned_brightness
-  transition: !input transition
-  off_transition: !input off_transition
-  disable_conditions: !input disable_when
+triggers:
+  - trigger: event
+    event_type: drift_beacon_focus_changed
+    event_data:
+      workspace_device_id: !input workspace
 
-trigger:
-  - platform: event
-    event_type: drift_beacon_session_started
-    id: session_started
+conditions:
+  # `not` over an empty list holds, so leaving the input empty never blocks the lights.
+  - condition: not
+    conditions: !input disable_when
 
-  - platform: event
-    event_type: drift_beacon_session_changed
-    id: session_changed
-
-  - platform: event
-    event_type: drift_beacon_session_stopped
-    id: session_stopped
-
-  - platform: event
-    event_type: drift_beacon_activity_pinned
-    id: activity_pinned
-
-  - platform: event
-    event_type: drift_beacon_activity_unpinned
-    id: activity_unpinned
-
-condition:
-  - condition: template
-    value_template: >-
-      {{ selected_workspace_id != '' and
-         trigger.event.data.workspace_id == selected_workspace_id }}
-
-action:
-  - if: "{{ disable_conditions | length > 0 }}"
-    then:
-      # Disable conditions are set, check if they're true
-      - if: !input disable_when
-        then: []  # Conditions met, skip automation
-        else:
-          - choose:
-              # Session started or changed -> session lighting (highest priority)
-              - conditions:
-                  - condition: or
-                    conditions:
-                      - condition: trigger
-                        id: session_started
-                      - condition: trigger
-                        id: session_changed
-                sequence:
-                  - action: light.turn_on
-                    target: !input target_lights
-                    data:
-                      rgb_color: "{{ trigger.event.data.color }}"
-                      brightness_pct: !input session_brightness
-                      transition: !input transition
-
-              # Session stopped -> pinned lighting takes over if something is still
-              # pinned, otherwise off
-              - conditions:
-                  - condition: trigger
-                    id: session_stopped
-                sequence:
-                  - if: "{{ trigger.event.data.pinned_activity_id is not none }}"
-                    then:
-                      - action: light.turn_on
-                        target: !input target_lights
-                        data:
-                          rgb_color: "{{ trigger.event.data.pinned_color }}"
-                          brightness_pct: !input pinned_brightness
-                          transition: !input transition
-                    else:
-                      - action: light.turn_off
-                        target: !input target_lights
-                        data:
-                          transition: !input off_transition
-
-              # Activity pinned -> pinned lighting, unless a session is already live
-              - conditions:
-                  - condition: trigger
-                    id: activity_pinned
-                  - condition: template
-                    value_template: "{{ not trigger.event.data.has_live_session }}"
-                sequence:
-                  - action: light.turn_on
-                    target: !input target_lights
-                    data:
-                      rgb_color: "{{ trigger.event.data.color }}"
-                      brightness_pct: !input pinned_brightness
-                      transition: !input transition
-
-              # Activity unpinned -> off, unless a session is already live
-              - conditions:
-                  - condition: trigger
-                    id: activity_unpinned
-                  - condition: template
-                    value_template: "{{ not trigger.event.data.has_live_session }}"
-                sequence:
-                  - action: light.turn_off
-                    target: !input target_lights
-                    data:
-                      transition: !input off_transition
-    else:
-      # No disable conditions set, always run
-      - choose:
-          # Session started or changed -> session lighting (highest priority)
-          - conditions:
-              - condition: or
-                conditions:
-                  - condition: trigger
-                    id: session_started
-                  - condition: trigger
-                    id: session_changed
-            sequence:
-              - action: light.turn_on
-                target: !input target_lights
-                data:
-                  rgb_color: "{{ trigger.event.data.color }}"
-                  brightness_pct: !input session_brightness
-                  transition: !input transition
-
-          # Session stopped -> pinned lighting takes over if something is still
-          # pinned, otherwise off
-          - conditions:
-              - condition: trigger
-                id: session_stopped
-            sequence:
-              - if: "{{ trigger.event.data.pinned_activity_id is not none }}"
-                then:
-                  - action: light.turn_on
-                    target: !input target_lights
-                    data:
-                      rgb_color: "{{ trigger.event.data.pinned_color }}"
-                      brightness_pct: !input pinned_brightness
-                      transition: !input transition
-                else:
-                  - action: light.turn_off
-                    target: !input target_lights
-                    data:
-                      transition: !input off_transition
-
-          # Activity pinned -> pinned lighting, unless a session is already live
-          - conditions:
-              - condition: trigger
-                id: activity_pinned
-              - condition: template
-                value_template: "{{ not trigger.event.data.has_live_session }}"
-            sequence:
-              - action: light.turn_on
-                target: !input target_lights
-                data:
-                  rgb_color: "{{ trigger.event.data.color }}"
-                  brightness_pct: !input pinned_brightness
-                  transition: !input transition
-
-          # Activity unpinned -> off, unless a session is already live
-          - conditions:
-              - condition: trigger
-                id: activity_unpinned
-              - condition: template
-                value_template: "{{ not trigger.event.data.has_live_session }}"
-            sequence:
-              - action: light.turn_off
-                target: !input target_lights
-                data:
-                  transition: !input off_transition
+actions:
+  - variables:
+      color: "{{ trigger.event.data.color }}"
+  - choose:
+      - conditions: "{{ trigger.event.data.state == 'live' and color is not none }}"
+        sequence:
+          - action: light.turn_on
+            target: !input target_lights
+            data:
+              rgb_color: "{{ color }}"
+              brightness_pct: !input session_brightness
+              transition: !input transition
+      - conditions: "{{ trigger.event.data.state == 'pinned' and color is not none }}"
+        sequence:
+          - action: light.turn_on
+            target: !input target_lights
+            data:
+              rgb_color: "{{ color }}"
+              brightness_pct: !input pinned_brightness
+              transition: !input transition
+    default:
+      - action: light.turn_off
+        target: !input target_lights
+        data:
+          transition: !input off_transition

@@ -1,367 +1,255 @@
-"""Sensor platform for Drift Beacon."""
+"""Progress sensors on activity devices; session, pin and user sensors on the workspace device."""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable
-from datetime import datetime
+from collections.abc import Hashable
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
+from homeassistant.const import EntityCategory, UnitOfTime
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
+    ATTR_ACTIVITY_DEVICE_ID,
     ATTR_ACTIVITY_ID,
-    ATTR_ACTIVITY_NAME,
-    ATTR_CATEGORY_COLOR,
-    ATTR_CATEGORY_ICON,
     ATTR_CATEGORY_ID,
     ATTR_CATEGORY_NAME,
     ATTR_COLOR,
-    ATTR_ICON,
+    ATTR_DESCRIPTION,
+    ATTR_MEMBER_IDS,
     ATTR_PINNED_AT,
-    ATTR_PROGRESS,
-    ATTR_SESSION_DURATION,
-    ATTR_SESSION_DURATION_FORMATTED,
-    ATTR_SESSION_START_TIME,
+    ATTR_SESSION_ID,
+    ATTR_STARTED_AT,
     ATTR_TARGET,
-    ATTR_UNIT,
+    ATTR_TRACKING_TYPE,
     ATTR_USER_ID,
-    ATTR_WORKSPACE_ID,
-    ATTR_WORKSPACE_NAME,
 )
-from .coordinator import (
-    DriftBeaconConfigEntry,
-    DriftBeaconWebSocketManager,
-    hex_to_rgb,
+from .coordinator import DriftBeaconConfigEntry
+from .entity import (
+    ActivityEntity,
+    WorkspaceEntity,
+    async_setup_activity_entities,
+    compact,
 )
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
+
+
+def _mdi(icon: str | None) -> str | None:
+    """Activity icons are only usable in Home Assistant when they are MDI icons."""
+    return icon if icon and icon.startswith("mdi:") else None
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: DriftBeaconConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up the Drift Beacon sensor platform."""
-    manager = entry.runtime_data
-    async_add_entities([DriftBeaconConnectedUserSensor(manager)])
-    live_entities: dict[str, DriftBeaconLiveSessionSensor] = {}
-    pinned_entities: dict[str, DriftBeaconPinnedActivitySensor] = {}
-
-    @callback
-    def _async_add_remove_entities() -> None:
-        """Keep workspace sensors synchronized with subscription snapshots."""
-        workspaces = {workspace["id"]: workspace for workspace in manager.workspaces}
-        existing_ids = set(live_entities)
-
-        new_entities = []
-        for workspace_id in workspaces.keys() - existing_ids:
-            entity = DriftBeaconLiveSessionSensor(manager, workspace_id)
-            live_entities[workspace_id] = entity
-            new_entities.append(entity)
-
-        if new_entities:
-            async_add_entities(new_entities)
-
-        for workspace_id in existing_ids - workspaces.keys():
-            entity = live_entities.pop(workspace_id)
-            hass.async_create_task(entity.async_remove())
-
-        pinned_workspace_ids = set(workspaces)
-        existing_pinned_ids = set(pinned_entities)
-        new_pinned_entities = []
-        for workspace_id in pinned_workspace_ids - existing_pinned_ids:
-            entity = DriftBeaconPinnedActivitySensor(manager, workspace_id)
-            pinned_entities[workspace_id] = entity
-            new_pinned_entities.append(entity)
-
-        if new_pinned_entities:
-            async_add_entities(new_pinned_entities)
-
-        for workspace_id in existing_pinned_ids - pinned_workspace_ids:
-            entity = pinned_entities.pop(workspace_id)
-            hass.async_create_task(entity.async_remove())
-
-    _async_add_remove_entities()
-    entry.async_on_unload(manager.async_add_listener(_async_add_remove_entities))
+    """Set up the sensors."""
+    coordinator = entry.runtime_data
+    async_add_entities(
+        [
+            CurrentSessionSensor(coordinator, "current_session"),
+            PinnedActivitySensor(coordinator, "pinned_activity"),
+            ConnectedUserSensor(coordinator, "connected_user"),
+        ]
+    )
+    async_setup_activity_entities(
+        entry,
+        async_add_entities,
+        {
+            TimeProgressSensor.role: (
+                lambda a: a.tracking_type == "span",
+                TimeProgressSensor,
+            ),
+            CountProgressSensor.role: (
+                lambda a: a.tracking_type == "point",
+                CountProgressSensor,
+            ),
+        },
+    )
 
 
-class DriftBeaconConnectedUserSensor(SensorEntity):
-    """The Drift Beacon user represented by this workspace connection."""
+class ProgressSensor(ActivityEntity, SensorEntity):
+    """Progress for the activity's progress period, across all workspace members.
 
-    _attr_has_entity_name = True
-    _attr_icon = "mdi:account-circle-outline"
-    _attr_name = "Connected user"
-    _attr_entity_registry_visible_default = False
+    Timed activities report completed-session time (the running session is not included);
+    point activities report their mark count. No ``state_class``: long-term statistics for
+    every activity are not worth their cost.
+    """
 
-    def __init__(self, manager: DriftBeaconWebSocketManager) -> None:
-        self._manager = manager
-        self._remove_listener: Callable | None = None
-        self._attr_unique_id = f"{manager.workspace_id}:connected_user"
-        self._attr_device_info = manager.device_info
+    entity_translation_key = "progress"
+    # Static or rarely changing metadata stays out of the recorder.
+    _unrecorded_attributes = frozenset(
+        {
+            ATTR_ACTIVITY_ID,
+            ATTR_TRACKING_TYPE,
+            ATTR_COLOR,
+            ATTR_DESCRIPTION,
+            ATTR_CATEGORY_ID,
+            ATTR_CATEGORY_NAME,
+        }
+    )
+
+    def state_key(self) -> Hashable:
+        """Depends on the activity and the name of its category."""
+        activity = self.activity
+        category = (
+            self.coordinator.data.categories.get(activity.category_id)
+            if activity and activity.category_id
+            else None
+        )
+        return (activity, category)
+
+    @property
+    def native_value(self) -> float | None:
+        """Progress in the current progress period."""
+        activity = self.activity
+        return activity.progress if activity else None
+
+    @property
+    def icon(self) -> str | None:
+        """The activity's own icon, when it is an MDI icon."""
+        activity = self.activity
+        return _mdi(activity.icon) if activity else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Target plus activity metadata for templates and dashboards."""
+        activity = self.activity
+        if activity is None:
+            return {}
+        category = self.coordinator.data.categories.get(activity.category_id or "")
+        return compact(
+            {
+                ATTR_TARGET: activity.target,
+                ATTR_ACTIVITY_ID: activity.id,
+                ATTR_TRACKING_TYPE: activity.tracking_type,
+                ATTR_COLOR: activity.color,
+                ATTR_DESCRIPTION: activity.description,
+                ATTR_CATEGORY_ID: activity.category_id,
+                ATTR_CATEGORY_NAME: category.name if category else None,
+            }
+        )
+
+
+class TimeProgressSensor(ProgressSensor):
+    """Completed-session time for a timed activity."""
+
+    role = "progress_time"
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.SECONDS
+    _attr_suggested_unit_of_measurement = UnitOfTime.HOURS
+    _attr_suggested_display_precision = 1
+
+
+class CountProgressSensor(ProgressSensor):
+    """Mark count for a point activity."""
+
+    role = "progress_count"
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        """The activity's own unit, if it has one."""
+        activity = self.activity
+        return activity.unit if activity else None
+
+
+class CurrentSessionSensor(WorkspaceEntity, SensorEntity):
+    """Name of the activity the connection user is tracking, or unknown when idle."""
+
+    _unrecorded_attributes = frozenset({ATTR_ACTIVITY_DEVICE_ID, ATTR_MEMBER_IDS})
+
+    @property
+    def native_value(self) -> str | None:
+        """The live activity's name."""
+        state = self.coordinator.data
+        session = state.live_session
+        if session is None:
+            return None
+        activity = state.activity(session.activity_id)
+        # A session can outlive its activity being archived; still report that something is live.
+        return activity.name if activity else session.activity_id
+
+    @property
+    def icon(self) -> str | None:
+        """The live activity's icon."""
+        state = self.coordinator.data
+        session = state.live_session
+        activity = state.activity(session.activity_id) if session else None
+        return _mdi(activity.icon) if activity else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Identify the session and its activity device."""
+        session = self.coordinator.data.live_session
+        if session is None:
+            return {}
+        return compact(
+            {
+                ATTR_ACTIVITY_ID: session.activity_id,
+                ATTR_ACTIVITY_DEVICE_ID: self.coordinator.devices.activity_device_id(
+                    session.activity_id
+                ),
+                ATTR_SESSION_ID: session.id,
+                ATTR_STARTED_AT: session.started_at,
+                ATTR_MEMBER_IDS: list(session.member_ids),
+            }
+        )
+
+
+class PinnedActivitySensor(WorkspaceEntity, SensorEntity):
+    """Name of the connection user's pinned activity, or unknown when nothing is pinned."""
+
+    _unrecorded_attributes = frozenset({ATTR_ACTIVITY_DEVICE_ID})
+
+    @property
+    def native_value(self) -> str | None:
+        """The pinned activity's name."""
+        state = self.coordinator.data
+        pinned = state.pinned
+        if pinned is None:
+            return None
+        activity = state.activity(pinned.activity_id)
+        return activity.name if activity else pinned.activity_id
+
+    @property
+    def icon(self) -> str | None:
+        """The pinned activity's icon."""
+        state = self.coordinator.data
+        pinned = state.pinned
+        activity = state.activity(pinned.activity_id) if pinned else None
+        return _mdi(activity.icon) if activity else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Identify the pinned activity and its device."""
+        pinned = self.coordinator.data.pinned
+        if pinned is None:
+            return {}
+        return compact(
+            {
+                ATTR_ACTIVITY_ID: pinned.activity_id,
+                ATTR_ACTIVITY_DEVICE_ID: self.coordinator.devices.activity_device_id(
+                    pinned.activity_id
+                ),
+                ATTR_PINNED_AT: pinned.pinned_at,
+            }
+        )
+
+
+class ConnectedUserSensor(WorkspaceEntity, SensorEntity):
+    """The Drift Beacon user this connection acts for."""
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     @property
     def native_value(self) -> str:
-        """Return the connected user's friendly name."""
-        return self._manager.user_name
-
-    @property
-    def available(self) -> bool:
-        """Return whether the authenticated workspace is connected."""
-        return self._manager.available
-
-    @property
-    def extra_state_attributes(self) -> dict[str, str]:
-        """Expose the stable Drift Beacon user identifier."""
-        return {ATTR_USER_ID: self._manager.user_id}
-
-    async def async_added_to_hass(self) -> None:
-        """Register for identity and connection updates."""
-        self._remove_listener = self._manager.async_add_listener(
-            self.async_write_ha_state
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Remove the coordinator listener."""
-        if self._remove_listener:
-            self._remove_listener()
-
-
-class DriftBeaconLiveSessionSensor(SensorEntity):
-    """Sensor representing the live session state for a specific workspace."""
-
-    _attr_has_entity_name = True
-
-    def __init__(
-        self,
-        manager: DriftBeaconWebSocketManager,
-        workspace_id: str,
-    ) -> None:
-        """Initialize the sensor."""
-        self._manager = manager
-        self._workspace_id = workspace_id
-        self._remove_listener: Callable | None = None
-
-        # Set unique ID for entity registry (include workspace)
-        self._attr_unique_id = f"{manager.workspace_id}:session"
-
-        # Set entity name (include workspace name)
-        self._attr_name = "Session"
-
-        # Link to device
-        self._attr_device_info = manager.device_info
-
-    async def async_added_to_hass(self) -> None:
-        """Register listener when added to hass."""
-        self._remove_listener = self._manager.async_add_listener(
-            self.async_write_ha_state
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Remove listener when removed from hass."""
-        if self._remove_listener:
-            self._remove_listener()
-
-    @property
-    def native_value(self) -> str | None:
-        """Return the activity name, or None if no active session in this workspace."""
-        session = self._manager.get_live_session(self._workspace_id)
-        if session is None:
-            return None
-
-        activity = self._manager.get_activity(session["activity_id"])
-        if activity is None:
-            return None
-
-        return activity["name"]
-
-    @property
-    def icon(self) -> str:
-        """Return the icon for the current activity."""
-        session = self._manager.get_live_session(self._workspace_id)
-        if session is None:
-            return "mdi:circle"
-
-        activity = self._manager.get_activity(session["activity_id"])
-        if activity is None or not activity.get("icon"):
-            return "mdi:circle"
-
-        return activity["icon"]
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        return self._manager.available
+        """The user's display name."""
+        return self.coordinator.data.user_name
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return additional state attributes."""
-        session = self._manager.get_live_session(self._workspace_id)
-
-        # If no session in this workspace, return workspace info only
-        if session is None:
-            return {
-                ATTR_WORKSPACE_ID: self._workspace_id,
-                ATTR_WORKSPACE_NAME: self._manager.workspace_name,
-                **self._manager.user_attributes,
-            }
-
-        # Find the activity for this session
-        activity = self._manager.get_activity(session["activity_id"])
-        if activity is None:
-            _LOGGER.warning(
-                "Activity %s not found for live session", session["activity_id"]
-            )
-            return {
-                ATTR_WORKSPACE_ID: self._workspace_id,
-                ATTR_WORKSPACE_NAME: self._manager.workspace_name,
-                **self._manager.user_attributes,
-            }
-
-        # Look up category
-        category = self._manager.get_category(activity.get("category_id"))
-
-        attributes = {
-            ATTR_ACTIVITY_ID: activity["id"],
-            ATTR_ACTIVITY_NAME: activity["name"],
-            ATTR_COLOR: hex_to_rgb(activity["color"]),
-            ATTR_ICON: activity["icon"],
-            ATTR_CATEGORY_ID: activity.get("category_id"),
-            ATTR_CATEGORY_NAME: category["name"] if category else None,
-            ATTR_CATEGORY_ICON: category["icon"] if category else None,
-            ATTR_CATEGORY_COLOR: hex_to_rgb(category["color"]) if category else None,
-            ATTR_UNIT: activity.get("unit"),
-            ATTR_PROGRESS: activity["progress"]["current"],
-            ATTR_TARGET: activity["progress"]["target"],
-            ATTR_WORKSPACE_ID: self._workspace_id,
-            ATTR_WORKSPACE_NAME: self._manager.workspace_name,
-            ATTR_SESSION_START_TIME: session["start_time"],
-            **self._manager.user_attributes,
-        }
-
-        # Calculate duration if we have a start time
-        if session.get("start_time"):
-            try:
-                start_time = datetime.fromisoformat(
-                    session["start_time"].replace("Z", "+00:00")
-                )
-                duration = (
-                    datetime.now(start_time.tzinfo) - start_time
-                ).total_seconds()
-                duration_seconds = int(duration)
-                attributes[ATTR_SESSION_DURATION] = duration_seconds
-                attributes[ATTR_SESSION_DURATION_FORMATTED] = self._format_duration(
-                    duration_seconds
-                )
-            except (ValueError, TypeError) as err:
-                _LOGGER.debug("Failed to calculate session duration: %s", err)
-
-        return attributes
-
-    def _format_duration(self, seconds: int) -> str:
-        """Format duration in seconds to human-readable string."""
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-
-        if hours > 0:
-            return f"{hours}h {minutes}m {secs}s"
-        elif minutes > 0:
-            return f"{minutes}m {secs}s"
-        else:
-            return f"{secs}s"
-
-
-class DriftBeaconPinnedActivitySensor(SensorEntity):
-    """Sensor representing the authenticated user's pinned activity."""
-
-    _attr_has_entity_name = True
-    _attr_entity_registry_visible_default = False
-
-    def __init__(
-        self,
-        manager: DriftBeaconWebSocketManager,
-        workspace_id: str,
-    ) -> None:
-        """Initialize the pinned activity sensor."""
-        self._manager = manager
-        self._workspace_id = workspace_id
-        self._remove_listener: Callable | None = None
-        self._attr_unique_id = f"{manager.workspace_id}:pinned_activity"
-        self._attr_name = "Pinned activity"
-        self._attr_device_info = manager.device_info
-
-    async def async_added_to_hass(self) -> None:
-        """Register listener when added to Home Assistant."""
-        self._remove_listener = self._manager.async_add_listener(
-            self.async_write_ha_state
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Remove listener when removed from Home Assistant."""
-        if self._remove_listener:
-            self._remove_listener()
-
-    @property
-    def native_value(self) -> str | None:
-        """Return the pinned activity name."""
-        pinned_activity = self._manager.get_pinned_activity(self._workspace_id)
-        if pinned_activity is None:
-            return None
-        activity = self._manager.get_activity(pinned_activity["activity_id"])
-        return activity["name"] if activity else None
-
-    @property
-    def icon(self) -> str:
-        """Return the pinned activity icon."""
-        pinned_activity = self._manager.get_pinned_activity(self._workspace_id)
-        if pinned_activity is None:
-            return "mdi:target"
-        activity = self._manager.get_activity(pinned_activity["activity_id"])
-        if activity is None or not activity.get("icon"):
-            return "mdi:target"
-        return activity["icon"]
-
-    @property
-    def available(self) -> bool:
-        """Return whether pinned activity state is connected."""
-        return self._manager.available
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return workspace and pinned activity metadata."""
-        attributes: dict[str, Any] = {
-            ATTR_WORKSPACE_ID: self._workspace_id,
-            ATTR_WORKSPACE_NAME: self._manager.workspace_name,
-            **self._manager.user_attributes,
-        }
-        pinned_activity = self._manager.get_pinned_activity(self._workspace_id)
-        if pinned_activity is None:
-            return attributes
-
-        activity = self._manager.get_activity(pinned_activity["activity_id"])
-        if activity is None:
-            return attributes
-        category = self._manager.get_category(activity.get("category_id"))
-        attributes.update(
-            {
-                ATTR_ACTIVITY_ID: activity["id"],
-                ATTR_ACTIVITY_NAME: activity["name"],
-                ATTR_PINNED_AT: pinned_activity["pinned_at"],
-                ATTR_COLOR: hex_to_rgb(activity["color"]),
-                ATTR_ICON: activity["icon"],
-                ATTR_CATEGORY_ID: activity.get("category_id"),
-                ATTR_CATEGORY_NAME: category["name"] if category else None,
-                ATTR_CATEGORY_ICON: category["icon"] if category else None,
-                ATTR_CATEGORY_COLOR: (
-                    hex_to_rgb(category["color"]) if category else None
-                ),
-                ATTR_UNIT: activity.get("unit"),
-                ATTR_PROGRESS: activity["progress"]["current"],
-                ATTR_TARGET: activity["progress"]["target"],
-            }
-        )
-        return attributes
+        """The stable user id."""
+        return {ATTR_USER_ID: self.coordinator.data.user_id}

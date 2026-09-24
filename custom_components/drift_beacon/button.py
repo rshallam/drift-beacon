@@ -1,238 +1,44 @@
-"""Button platform for Drift Beacon point activities."""
+"""Mark buttons on point activity devices, and Stop session on the workspace device."""
 
 from __future__ import annotations
 
-import logging
-from collections.abc import Callable
-from typing import Any
-
 from homeassistant.components.button import ButtonEntity
-from homeassistant.core import HomeAssistant, callback
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
-from .const import (
-    ATTR_ACTIVITY_ID,
-    ATTR_ACTIVITY_NAME,
-    ATTR_CATEGORY_COLOR,
-    ATTR_CATEGORY_ICON,
-    ATTR_CATEGORY_ID,
-    ATTR_CATEGORY_NAME,
-    ATTR_COLOR,
-    ATTR_DESCRIPTION,
-    ATTR_ICON,
-    ATTR_PROGRESS,
-    ATTR_SORT_ORDER,
-    ATTR_TARGET,
-    ATTR_UNIT,
-    ATTR_WORKSPACE_ID,
-    ATTR_WORKSPACE_NAME,
-)
-from .coordinator import (
-    Activity,
-    DriftBeaconConfigEntry,
-    DriftBeaconWebSocketManager,
-    LiveSession,
-    Workspace,
-    hex_to_rgb,
-)
+from .coordinator import DriftBeaconConfigEntry
+from .entity import ActivityEntity, WorkspaceEntity, async_setup_activity_entities
 
-_LOGGER = logging.getLogger(__name__)
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
     entry: DriftBeaconConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    manager = entry.runtime_data
-
-    # Workspace-level control: one button that stops whatever session is live.
-    async_add_entities([DriftBeaconStopSessionButton(manager)])
-
-    entities: dict[str, DriftBeaconActivityButton] = {}
-
-    @callback
-    def _async_add_remove_entities() -> None:
-        """Add new entities and remove deleted ones."""
-        # Only create buttons for point activities (not archived)
-        point_activities = [
-            a
-            for a in manager.activities
-            if a.get("tracking_type") == "point" and not a.get("archived", False)
-        ]
-
-        current_activity_ids = {activity["id"] for activity in point_activities}
-        existing_ids = set(entities.keys())
-        new_ids = current_activity_ids - existing_ids
-        deleted_ids = existing_ids - current_activity_ids
-
-        new_entities = []
-        for activity in point_activities:
-            if activity["id"] in new_ids:
-                entity = DriftBeaconActivityButton(manager, activity)
-                entities[activity["id"]] = entity
-                new_entities.append(entity)
-
-        if new_entities:
-            async_add_entities(new_entities)
-
-        for activity_id in deleted_ids:
-            entity = entities.pop(activity_id)
-            hass.async_create_task(entity.async_remove())
-
-    _async_add_remove_entities()
-    entry.async_on_unload(manager.async_add_listener(_async_add_remove_entities))
+    """Set up the buttons."""
+    async_add_entities([StopSessionButton(entry.runtime_data, "stop_session")])
+    async_setup_activity_entities(
+        entry,
+        async_add_entities,
+        {MarkButton.role: (lambda a: a.tracking_type == "point", MarkButton)},
+    )
 
 
-class DriftBeaconActivityButton(ButtonEntity):
-    """Representation of a point activity as a button."""
+class MarkButton(ActivityEntity, ButtonEntity):
+    """Records one occurrence of a point activity."""
 
-    _attr_has_entity_name = True
-    _attr_entity_registry_visible_default = False
-
-    def __init__(
-        self,
-        manager: DriftBeaconWebSocketManager,
-        activity: Activity,
-    ) -> None:
-        """Initialize the button."""
-        self._manager = manager
-        self._activity_id = activity["id"]
-        self._remove_listener: Callable | None = None
-
-        self._attr_unique_id = f"{manager.workspace_id}:mark:{activity['id']}"
-        self._attr_name = activity["name"]
-        self._attr_device_info = manager.device_info
-
-    async def async_added_to_hass(self) -> None:
-        """Register listener when added to hass."""
-        self._remove_listener = self._manager.async_add_listener(
-            self.async_write_ha_state
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Remove listener when removed from hass."""
-        if self._remove_listener:
-            self._remove_listener()
-
-    @property
-    def available(self) -> bool:
-        """Return True if entity is available."""
-        if not self._manager.available:
-            return False
-        return self._get_activity() is not None
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Return additional state attributes."""
-        activity = self._get_activity()
-        if activity is None:
-            return {}
-
-        workspace = self._manager.get_workspace_for_activity(self._activity_id)
-        category = self._manager.get_category(activity.get("category_id"))
-
-        return {
-            ATTR_ACTIVITY_ID: activity["id"],
-            ATTR_DESCRIPTION: activity["description"],
-            ATTR_CATEGORY_ID: activity.get("category_id"),
-            ATTR_CATEGORY_NAME: category["name"] if category else None,
-            ATTR_CATEGORY_ICON: category["icon"] if category else None,
-            ATTR_CATEGORY_COLOR: hex_to_rgb(category["color"]) if category else None,
-            ATTR_COLOR: hex_to_rgb(activity["color"]),
-            ATTR_ICON: activity["icon"],
-            ATTR_SORT_ORDER: activity["sort_order"],
-            ATTR_UNIT: activity.get("unit"),
-            ATTR_PROGRESS: activity["progress"]["current"],
-            ATTR_TARGET: activity["progress"]["target"],
-            ATTR_WORKSPACE_ID: workspace["id"] if workspace else None,
-            ATTR_WORKSPACE_NAME: workspace["name"] if workspace else None,
-            **self._manager.user_attributes,
-        }
+    role = "mark"
 
     async def async_press(self) -> None:
-        """Handle the button press - mark the point activity."""
-        _LOGGER.debug("Pressing button for activity %s", self._activity_id)
-
-        workspace = self._manager.get_workspace_for_activity(self._activity_id)
-        if workspace is None:
-            _LOGGER.error(
-                "Cannot mark activity %s - workspace not found", self._activity_id
-            )
-            return
-
-        success = await self._manager.mark_activity(self._activity_id)
-
-        if not success:
-            _LOGGER.error("Failed to mark activity %s", self._activity_id)
-
-    def _get_activity(self) -> Activity | None:
-        """Get the activity data for this entity."""
-        return self._manager.get_activity(self._activity_id)
+        """Mark the activity."""
+        await self.coordinator.async_mark(self.activity_id)
 
 
-class DriftBeaconStopSessionButton(ButtonEntity):
-    """Workspace-level button that stops the currently live session, if any."""
-
-    _attr_has_entity_name = True
-    _attr_icon = "mdi:stop-circle-outline"
-    _attr_entity_registry_visible_default = False
-
-    def __init__(
-        self,
-        manager: DriftBeaconWebSocketManager,
-    ) -> None:
-        """Initialize the stop-session button."""
-        self._manager = manager
-        self._remove_listener: Callable | None = None
-
-        self._attr_unique_id = f"{manager.workspace_id}:stop_session"
-        self._attr_name = "Stop session"
-        self._attr_device_info = manager.device_info
-
-    async def async_added_to_hass(self) -> None:
-        """Register listener when added to hass."""
-        self._remove_listener = self._manager.async_add_listener(
-            self.async_write_ha_state
-        )
-
-    async def async_will_remove_from_hass(self) -> None:
-        """Remove listener when removed from hass."""
-        if self._remove_listener:
-            self._remove_listener()
-
-    @property
-    def available(self) -> bool:
-        """Return True whenever connected — pressing with no session is a no-op."""
-        return self._manager.available
-
-    @property
-    def extra_state_attributes(self) -> dict[str, Any]:
-        """Expose the current live session (if any) for dashboard convenience."""
-        workspace, session = self._get_live_context()
-        if workspace is None or session is None:
-            return self._manager.user_attributes
-
-        activity = self._manager.get_activity(session["activity_id"])
-        return {
-            ATTR_ACTIVITY_ID: session["activity_id"],
-            ATTR_ACTIVITY_NAME: activity["name"] if activity else None,
-            ATTR_WORKSPACE_ID: workspace["id"],
-            ATTR_WORKSPACE_NAME: workspace["name"],
-            **self._manager.user_attributes,
-        }
+class StopSessionButton(WorkspaceEntity, ButtonEntity):
+    """Stops the connection user's live session, whichever activity it belongs to."""
 
     async def async_press(self) -> None:
-        """Stop whatever session is live for the connection user."""
-        _LOGGER.debug("Stop-session button pressed")
-        success = await self._manager.stop_session()
-        if not success:
-            _LOGGER.error("Failed to stop live session")
-
-    def _get_live_context(self) -> tuple[Workspace | None, LiveSession | None]:
-        """Return the workspace and live session, if a session is currently live."""
-        for workspace in self._manager.workspaces:
-            session = self._manager.get_live_session(workspace["id"])
-            if session is not None:
-                return workspace, session
-        return None, None
+        """Stop the live session; nothing live is a no-op."""
+        await self.coordinator.async_stop_current_session()
